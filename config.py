@@ -1,43 +1,125 @@
 #!/usr/bin/env python3
-"""
-Enterprise Network Configuration Vulnerability Assessment (MCVA) Tool
-Multi-vendor support with NIST guidelines, CVSS scoring, and Knowledge Base Integration
-Supports: Cisco IOS, Juniper JUNOS, Fortinet FortiOS, Palo Alto PAN-OS
-"""
 
-from flask import Flask, request, render_template_string, jsonify, send_file, flash, redirect, url_for, session
-import re
 import json
-import os
-import tempfile
 import csv
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, asdict
-from enum import Enum
-from werkzeug.utils import secure_filename
+import re
 import io
+from dataclasses import dataclass
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple, Union
+from enum import Enum
+from tempfile import TemporaryFile
 
-app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-this-in-production'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-
-class Severity(Enum):
-    CRITICAL = "CRITICAL"
-    HIGH = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
-    INFO = "INFO"
+from flask import Flask, request, render_template_string, jsonify, session, flash, redirect, url_for, make_response
+from werkzeug.utils import secure_filename
 
 class Vendor(Enum):
-    CISCO = "Cisco IOS"
-    JUNIPER = "Juniper JUNOS"
-    FORTINET = "Fortinet FortiOS"
-    PALOALTO = "Palo Alto PAN-OS"
+    CISCO_IOS = "Cisco IOS"
+    JUNIPER_JUNOS = "Juniper JUNOS" 
+    FORTINET_FORTIOS = "Fortinet FortiOS"
+    PALOALTO_PANOS = "Palo Alto PAN-OS"
     UNKNOWN = "Unknown"
+
+class CVSSCalculator:
+    @staticmethod
+    def calculate_base_score(attack_vector: str, attack_complexity: str, 
+                           privileges_required: str, user_interaction: str, 
+                           scope: str, confidentiality: str, integrity: str, 
+                           availability: str) -> Tuple[float, str]:
+        
+        av_values = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+        ac_values = {"L": 0.77, "H": 0.44}
+        pr_values = {
+            ("N", "U"): 0.85, ("N", "C"): 0.85,
+            ("L", "U"): 0.62, ("L", "C"): 0.68,
+            ("H", "U"): 0.27, ("H", "C"): 0.5
+        }
+        ui_values = {"N": 0.85, "R": 0.62}
+        impact_values = {"H": 0.56, "L": 0.22, "N": 0.0}
+        
+        av = av_values.get(attack_vector, 0.85)
+        ac = ac_values.get(attack_complexity, 0.77)
+        pr = pr_values.get((privileges_required, scope), 0.85)
+        ui = ui_values.get(user_interaction, 0.85)
+        
+        c = impact_values.get(confidentiality, 0.0)
+        i = impact_values.get(integrity, 0.0)
+        a = impact_values.get(availability, 0.0)
+        
+        impact_sub_score = 1 - ((1 - c) * (1 - i) * (1 - a))
+        
+        if scope == "U":
+            impact = 6.42 * impact_sub_score
+        else:
+            impact = 7.52 * (impact_sub_score - 0.029) - 3.25 * pow((impact_sub_score - 0.02), 15)
+        
+        exploitability = 8.22 * av * ac * pr * ui
+        
+        if impact <= 0:
+            base_score = 0.0
+        elif scope == "U":
+            base_score = min(impact + exploitability, 10.0)
+        else:
+            base_score = min(1.08 * (impact + exploitability), 10.0)
+        
+        base_score = round(base_score, 1)
+        
+        vector = f"CVSS:3.1/AV:{attack_vector}/AC:{attack_complexity}/PR:{privileges_required}/UI:{user_interaction}/S:{scope}/C:{confidentiality}/I:{integrity}/A:{availability}"
+        
+        return base_score, vector
+
+class VendorDetector:
+    @staticmethod
+    def detect_vendor(config_content: str) -> Vendor:
+        config_lower = config_content.lower()
+        
+        cisco_indicators = [
+            "version 15", "version 12", "cisco ios", "enable secret",
+            "ip http server", "snmp-server community", "line con 0",
+            "line vty", "interface gigabitethernet", "router ospf"
+        ]
+        
+        juniper_indicators = [
+            "version 20", "version 19", "junos", "set system",
+            "set interfaces", "set routing-options", "set security",
+            "set policy-options", "set firewall"
+        ]
+        
+        fortinet_indicators = [
+            "config system global", "config firewall policy",
+            "config user local", "config system interface",
+            "fortios", "fortigate"
+        ]
+        
+        paloalto_indicators = [
+            "config mgt-config", "config deviceconfig system",
+            "config network interface", "config rulebase security",
+            "pan-os", "panos"
+        ]
+        
+        cisco_count = sum(1 for indicator in cisco_indicators if indicator in config_lower)
+        juniper_count = sum(1 for indicator in juniper_indicators if indicator in config_lower)
+        fortinet_count = sum(1 for indicator in fortinet_indicators if indicator in config_lower)
+        paloalto_count = sum(1 for indicator in paloalto_indicators if indicator in config_lower)
+        
+        max_count = max(cisco_count, juniper_count, fortinet_count, paloalto_count)
+        
+        if max_count == 0:
+            return Vendor.UNKNOWN
+        elif cisco_count == max_count:
+            return Vendor.CISCO_IOS
+        elif juniper_count == max_count:
+            return Vendor.JUNIPER_JUNOS
+        elif fortinet_count == max_count:
+            return Vendor.FORTINET_FORTIOS
+        elif paloalto_count == max_count:
+            return Vendor.PALOALTO_PANOS
+        
+        return Vendor.UNKNOWN
 
 @dataclass
 class Finding:
+    id: str
     category: str
     severity: str
     title: str
@@ -49,266 +131,490 @@ class Finding:
     cvss_vector: str
     nist_controls: List[str]
     vendor: str
-    source: str = "automated"  # "automated" or "knowledge_base" or "enriched"
-    kb_finding_id: str = None
-    organizational_context: str = None
-    historical_incidents: str = None
-    business_impact: str = None
-    remediation_priority: str = None
-    custom_tags: List[str] = None
-    id: str = None
-
-    def __post_init__(self):
-        if self.id is None:
-            self.id = f"{self.vendor}_{self.category}_{self.line_number}_{hash(self.title) % 10000}"
-        if self.custom_tags is None:
-            self.custom_tags = []
-
-@dataclass 
-class KnowledgeBaseFinding:
-    finding_id: str
-    title: str
-    description: str
-    category: str
-    severity: str
-    cvss_score: float
-    nist_controls: List[str]
-    config_patterns: List[str]  # Regex patterns to match config lines
-    vendor: str
-    organizational_context: str = ""
-    historical_incidents: str = ""
-    business_impact: str = ""
-    remediation_priority: str = ""
-    custom_recommendation: str = ""
-    custom_tags: List[str] = None
-
-    def __post_init__(self):
-        if self.custom_tags is None:
-            self.custom_tags = []
-
-# NIST 800-53 Security Controls Mapping
-NIST_CONTROLS = {
-    'AC-2': 'Account Management',
-    'AC-3': 'Access Enforcement', 
-    'AC-6': 'Least Privilege',
-    'AC-7': 'Unsuccessful Logon Attempts',
-    'AC-11': 'Session Lock',
-    'AC-12': 'Session Termination',
-    'AU-3': 'Audit Content',
-    'AU-6': 'Audit Review, Analysis, and Reporting',
-    'AU-8': 'Time Stamps',
-    'AU-9': 'Protection of Audit Information',
-    'AU-12': 'Audit Generation',
-    'CM-6': 'Configuration Settings',
-    'CM-7': 'Least Functionality',
-    'IA-2': 'Identification and Authentication',
-    'IA-5': 'Authenticator Management',
-    'IA-8': 'Identification and Authentication (Non-Organizational Users)',
-    'SC-5': 'Denial of Service Protection',
-    'SC-7': 'Boundary Protection',
-    'SC-8': 'Transmission Confidentiality and Integrity',
-    'SC-23': 'Session Authenticity',
-    'SI-4': 'Information System Monitoring'
-}
-
-class CVSSCalculator:
-    """CVSS v3.1 Base Score Calculator"""
-    
-    @staticmethod
-    def calculate_base_score(attack_vector: str, attack_complexity: str, 
-                           privileges_required: str, user_interaction: str,
-                           scope: str, confidentiality: str, integrity: str, 
-                           availability: str) -> tuple:
-        # CVSS v3.1 Base Score Calculation
-        av_values = {'N': 0.85, 'A': 0.62, 'L': 0.55, 'P': 0.2}
-        ac_values = {'L': 0.77, 'H': 0.44}
-        pr_values = {'N': 0.85, 'L': 0.62, 'H': 0.27}
-        ui_values = {'N': 0.85, 'R': 0.62}
-        s_values = {'U': 'unchanged', 'C': 'changed'}
-        cia_values = {'H': 0.56, 'L': 0.22, 'N': 0.0}
-        
-        # Adjust PR for scope change
-        if scope == 'C' and privileges_required == 'L':
-            pr_values['L'] = 0.68
-        elif scope == 'C' and privileges_required == 'H':
-            pr_values['H'] = 0.50
-            
-        exploitability = 8.22 * av_values[attack_vector] * ac_values[attack_complexity] * pr_values[privileges_required] * ui_values[user_interaction]
-        
-        impact_sub = 1 - ((1 - cia_values[confidentiality]) * (1 - cia_values[integrity]) * (1 - cia_values[availability]))
-        
-        if scope == 'U':
-            impact = 6.42 * impact_sub
-        else:
-            impact = 7.52 * (impact_sub - 0.029) - 3.25 * pow(impact_sub - 0.02, 15)
-        
-        if impact <= 0:
-            base_score = 0.0
-        elif scope == 'U':
-            base_score = min(exploitability + impact, 10.0)
-        else:
-            base_score = min(1.08 * (exploitability + impact), 10.0)
-            
-        # Round up to nearest 0.1
-        base_score = round(base_score * 10) / 10
-        
-        vector = f"CVSS:3.1/AV:{attack_vector}/AC:{attack_complexity}/PR:{privileges_required}/UI:{user_interaction}/S:{scope}/C:{confidentiality}/I:{integrity}/A:{availability}"
-        
-        return base_score, vector
-
-class VendorDetector:
-    """Auto-detect vendor from configuration content"""
-    
-    @staticmethod
-    def detect_vendor(config_content: str) -> Vendor:
-        content_lower = config_content.lower()
-        
-        # Cisco IOS indicators
-        if any(indicator in content_lower for indicator in [
-            'version 12.', 'version 15.', 'version 16.', 'version 17.',
-            'hostname', 'enable secret', 'interface gigabitethernet',
-            'ip route', 'router ospf', 'access-list', '!', 'end'
-        ]):
-            return Vendor.CISCO
-            
-        # Juniper JUNOS indicators  
-        elif any(indicator in content_lower for indicator in [
-            'version 20', 'version 21', 'version 22', 'version 23',
-            'system {', 'interfaces {', 'routing-options {',
-            'security {', 'host-name', 'root-authentication'
-        ]):
-            return Vendor.JUNIPER
-            
-        # Fortinet FortiOS indicators
-        elif any(indicator in content_lower for indicator in [
-            'config system global', 'config firewall policy',
-            'config system interface', 'config router static',
-            'set hostname', 'config system admin'
-        ]):
-            return Vendor.FORTINET
-            
-        # Palo Alto PAN-OS indicators
-        elif any(indicator in content_lower for indicator in [
-            '<config version=', '<deviceconfig>', '<network>',
-            '<vsys>', '<shared>', '<template>', '<devices>'
-        ]):
-            return Vendor.PALOALTO
-            
-        else:
-            return Vendor.UNKNOWN
-
-class KnowledgeBaseManager:
-    """Manages organizational knowledge base of findings"""
-    
-    def __init__(self):
-        self.findings: List[KnowledgeBaseFinding] = []
-    
-    def load_from_json(self, json_content: str) -> None:
-        """Load knowledge base from JSON format"""
-        try:
-            data = json.loads(json_content)
-            
-            # Handle both single finding and array of findings
-            if isinstance(data, list):
-                findings_data = data
-            else:
-                findings_data = data.get('findings', [data])
-            
-            for finding_data in findings_data:
-                kb_finding = KnowledgeBaseFinding(
-                    finding_id=finding_data.get('finding_id', ''),
-                    title=finding_data.get('title', ''),
-                    description=finding_data.get('description', ''),
-                    category=finding_data.get('category', ''),
-                    severity=finding_data.get('severity', 'MEDIUM'),
-                    cvss_score=float(finding_data.get('cvss_score', 0.0)),
-                    nist_controls=finding_data.get('nist_controls', []),
-                    config_patterns=finding_data.get('config_patterns', []),
-                    vendor=finding_data.get('vendor', ''),
-                    organizational_context=finding_data.get('organizational_context', ''),
-                    historical_incidents=finding_data.get('historical_incidents', ''),
-                    business_impact=finding_data.get('business_impact', ''),
-                    remediation_priority=finding_data.get('remediation_priority', ''),
-                    custom_recommendation=finding_data.get('custom_recommendation', ''),
-                    custom_tags=finding_data.get('custom_tags', [])
-                )
-                self.findings.append(kb_finding)
-        
-        except Exception as e:
-            raise ValueError(f"Error parsing JSON knowledge base: {str(e)}")
-    
-    def load_from_csv(self, csv_content: str) -> None:
-        """Load knowledge base from CSV format"""
-        try:
-            csv_reader = csv.DictReader(io.StringIO(csv_content))
-            
-            for row in csv_reader:
-                kb_finding = KnowledgeBaseFinding(
-                    finding_id=row.get('finding_id', ''),
-                    title=row.get('title', ''),
-                    description=row.get('description', ''),
-                    category=row.get('category', ''),
-                    severity=row.get('severity', 'MEDIUM'),
-                    cvss_score=float(row.get('cvss_score', 0.0)),
-                    nist_controls=row.get('nist_controls', '').split(',') if row.get('nist_controls') else [],
-                    config_patterns=row.get('config_patterns', '').split('|') if row.get('config_patterns') else [],
-                    vendor=row.get('vendor', ''),
-                    organizational_context=row.get('organizational_context', ''),
-                    historical_incidents=row.get('historical_incidents', ''),
-                    business_impact=row.get('business_impact', ''),
-                    remediation_priority=row.get('remediation_priority', ''),
-                    custom_recommendation=row.get('custom_recommendation', ''),
-                    custom_tags=row.get('custom_tags', '').split(',') if row.get('custom_tags') else []
-                )
-                self.findings.append(kb_finding)
-                
-        except Exception as e:
-            raise ValueError(f"Error parsing CSV knowledge base: {str(e)}")
-    
-    def match_config_line(self, config_line: str, vendor: Vendor) -> Optional[KnowledgeBaseFinding]:
-        """Match a configuration line against knowledge base patterns"""
-        for kb_finding in self.findings:
-            # Check vendor match (if specified)
-            if kb_finding.vendor and kb_finding.vendor.lower() != vendor.value.lower():
-                continue
-                
-            # Check pattern matches
-            for pattern in kb_finding.config_patterns:
-                try:
-                    if re.search(pattern, config_line, re.IGNORECASE):
-                        return kb_finding
-                except re.error:
-                    # Skip invalid regex patterns
-                    continue
-        
-        return None
+    source: str = "automated"
+    cva_id: Optional[str] = None
 
 class MultiVendorAnalyzer:
-    """Multi-vendor configuration analyzer with knowledge base integration"""
-    
-    def __init__(self, knowledge_base: Optional[KnowledgeBaseManager] = None):
+    def __init__(self, cva_mappings: Optional[Dict] = None):
+        self.cva_mappings = cva_mappings or {}
         self.findings: List[Finding] = []
         self.config_lines: List[str] = []
         self.vendor: Vendor = Vendor.UNKNOWN
-        self.knowledge_base = knowledge_base
         
     def load_config_from_string(self, config_content: str) -> None:
-        """Load configuration from string content and detect vendor"""
-        self.config_lines = [line.rstrip() for line in config_content.split('\n')]
-        self.vendor = VendorDetector.detect_config_content)
-
-    def add_finding(self, category: str, severity: str, title: str, 
-                   description: str, line_num: int, config_line: str, 
-                   recommendation: str, cvss_vector_components: Dict[str, str],
-                   nist_controls: List[str], source: str = "automated",
-                   kb_finding: Optional[KnowledgeBaseFinding] = None) -> None:
-        """Add a finding with CVSS scoring, NIST controls, and optional KB enrichment"""
+        self.config_lines = config_content.split('\n')
+        self.vendor = VendorDetector.detect_vendor(config_content)
         
-        # Calculate CVSS score
-        cvss_score, cvss_vector = CVSSCalculator.calculate_base_score(**cvss_vector_components)
+    def analyze(self, config_content: str) -> List[Dict[str, Any]]:
+        self.findings.clear()
+        self.load_config_from_string(config_content)
         
-        # Create base finding
+        if self.vendor == Vendor.CISCO_IOS:
+            self._analyze_cisco_ios()
+        elif self.vendor == Vendor.JUNIPER_JUNOS:
+            self._analyze_juniper_junos()
+        elif self.vendor == Vendor.FORTINET_FORTIOS:
+            self._analyze_fortinet_fortios()
+        elif self.vendor == Vendor.PALOALTO_PANOS:
+            self._analyze_paloalto_panos()
+        
+        self._apply_cva_mappings()
+        
+        return [finding.__dict__ for finding in self.findings]
+        
+    def _analyze_cisco_ios(self):
+        for line_num, line in enumerate(self.config_lines, 1):
+            line_stripped = line.strip()
+            
+            # Authentication checks
+            if re.search(r'password\s+7\s+', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Authentication", "HIGH", "Cisco Type 7 Password",
+                    "Type 7 passwords are weakly encrypted and can be easily reversed",
+                    line_num, line_stripped,
+                    "Replace with enable secret or use stronger encryption",
+                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "L", "A": "N"},
+                    ["IA-5", "CM-6"],
+                    finding_type="cisco_type_7_pass"
+                )
+            
+            if re.search(r'password\s+0\s+', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Authentication", "CRITICAL", "Plain Text Password",
+                    "Password stored in plain text without encryption",
+                    line_num, line_stripped,
+                    "Use enable secret or encrypted passwords",
+                    {"AV": "L", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
+                    ["IA-5", "CM-6"],
+                    finding_type="pass_enc"
+                )
+            
+            if re.search(r'enable\s+password\s+\w+', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Authentication", "HIGH", "Enable Password Used",
+                    "Plain text enable password configured instead of enable secret",
+                    line_num, line_stripped,
+                    "Replace with enable secret command",
+                    {"AV": "L", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
+                    ["IA-5", "CM-6"],
+                    finding_type="enable_secret"
+                )
+            
+            if re.search(r'password\s+(\w{1,7}|cisco|admin|password|123456|default)$', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Authentication", "CRITICAL", "Weak/Default Password",
+                    "Weak or default password detected that is easily guessable",
+                    line_num, line_stripped,
+                    "Use complex passwords with minimum 8 characters, numbers, and symbols",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "H"},
+                    ["IA-5", "AC-2"],
+                    finding_type="default_password"
+                )
+            
+            # Service checks
+            if re.search(r'ip\s+http\s+server', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "MEDIUM", "HTTP Server Enabled",
+                    "HTTP management interface enabled without HTTPS",
+                    line_num, line_stripped,
+                    "Disable HTTP and enable HTTPS: 'no ip http server' and 'ip http secure-server'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
+                    ["SC-8", "CM-7"],
+                    finding_type="no_http_https"
+                )
+            
+            if re.search(r'service\s+finger', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "LOW", "Finger Service Enabled",
+                    "Finger service provides system information to attackers",
+                    line_num, line_stripped,
+                    "Disable finger service: 'no service finger'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
+                    ["CM-7"],
+                    finding_type="no_finger"
+                )
+            
+            if re.search(r'ip\s+bootp\s+server', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "MEDIUM", "BOOTP Server Enabled",
+                    "BOOTP server can be used for network reconnaissance",
+                    line_num, line_stripped,
+                    "Disable BOOTP server: 'no ip bootp server'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
+                    ["CM-7", "SC-7"],
+                    finding_type="no_bootp"
+                )
+            
+            if re.search(r'ip\s+source-route', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Network Services", "MEDIUM", "IP Source Routing Enabled",
+                    "IP source routing can be exploited to bypass network security controls",
+                    line_num, line_stripped,
+                    "Disable IP source routing: 'no ip source-route'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
+                    ["SC-7", "CM-7"],
+                    finding_type="no_source_route"
+                )
+            
+            # SNMP checks
+            if re.search(r'snmp-server\s+community\s+(public|private)', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "SNMP", "CRITICAL", "Default SNMP Community",
+                    "Default SNMP community strings detected",
+                    line_num, line_stripped,
+                    "Change to complex community string and restrict access",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "C", "C": "H", "I": "H", "A": "H"},
+                    ["IA-2", "AC-3"],
+                    finding_type="default_password"
+                )
+            
+            if re.search(r'snmp-server\s+community\s+\w+\s+RW', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "SNMP", "HIGH", "SNMP Write Access Enabled",
+                    "SNMP community with write access poses security risk",
+                    line_num, line_stripped,
+                    "Remove write access or use read-only communities with ACL restrictions",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "L"},
+                    ["AC-3", "CM-6"],
+                    finding_type="no_snmp_server_ro_rw"
+                )
+            
+            if re.search(r'snmp-server\s+community\s+\w{1,8}\s+', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "SNMP", "MEDIUM", "Short SNMP Community String",
+                    "SNMP community string is too short and easily guessable",
+                    line_num, line_stripped,
+                    "Use complex community string with 16+ characters",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
+                    ["IA-2", "AC-3"],
+                    finding_type="no_snmp_server_ro_rw"
+                )
+            
+            # Access Control checks
+            if re.search(r'transport\s+input\s+telnet', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Access Control", "HIGH", "Telnet Access Enabled",
+                    "Telnet provides unencrypted remote access",
+                    line_num, line_stripped,
+                    "Use SSH only: 'transport input ssh'",
+                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
+                    ["SC-8", "AC-17"],
+                    finding_type="transport_input"
+                )
+            
+            if re.search(r'transport\s+input\s+all', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Access Control", "HIGH", "All Transport Methods Enabled",
+                    "All transport methods (including insecure protocols) are enabled",
+                    line_num, line_stripped,
+                    "Restrict to SSH only: 'transport input ssh'",
+                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
+                    ["SC-8", "AC-17"],
+                    finding_type="transport_all"
+                )
+            
+            if re.search(r'exec-timeout\s+0\s+0', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Access Control", "MEDIUM", "No Session Timeout",
+                    "Console/VTY session timeout is disabled",
+                    line_num, line_stripped,
+                    "Set appropriate timeout: 'exec-timeout 10 0'",
+                    {"AV": "P", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
+                    ["AC-12", "SC-10"],
+                    finding_type="session_timeout"
+                )
+            
+            # Network service checks
+            if re.search(r'cdp\s+run', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Network Services", "LOW", "CDP Enabled Globally",
+                    "Cisco Discovery Protocol exposes network topology information",
+                    line_num, line_stripped,
+                    "Disable CDP globally or on external interfaces: 'no cdp run'",
+                    {"AV": "A", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
+                    ["SC-7", "CM-7"],
+                    finding_type="cdp_cisco"
+                )
+            
+            if re.search(r'ip\s+proxy-arp', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Network Services", "LOW", "Proxy ARP Enabled",
+                    "Proxy ARP can be exploited for man-in-the-middle attacks",
+                    line_num, line_stripped,
+                    "Disable proxy ARP: 'no ip proxy-arp'",
+                    {"AV": "A", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
+                    ["SC-7", "CM-7"],
+                    finding_type="no_proxy_arp"
+                )
+            
+            if re.search(r'ip\s+directed-broadcast', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Network Services", "MEDIUM", "Directed Broadcast Enabled",
+                    "IP directed broadcast can be used for DDoS amplification attacks",
+                    line_num, line_stripped,
+                    "Disable directed broadcast: 'no ip directed-broadcast'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "C", "C": "N", "I": "N", "A": "H"},
+                    ["SC-7", "CM-7"],
+                    finding_type="no_directed_broadcast"
+                )
+            
+            # Additional authentication checks
+            if re.search(r'username\s+\w+\s+password\s+0\s+', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Authentication", "HIGH", "Plain Text Username Password",
+                    "Username configured with plain text password",
+                    line_num, line_stripped,
+                    "Use encrypted passwords or enable service password-encryption",
+                    {"AV": "L", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
+                    ["IA-5", "CM-6"],
+                    finding_type="pass_enc"
+                )
+            
+            # Logging checks
+            if re.search(r'^logging\s+\d+\.\d+\.\d+\.\d+$', line_stripped, re.IGNORECASE):
+                if not re.search(r'logging\s+trap', '\n'.join(self.config_lines), re.IGNORECASE):
+                    self.add_finding(
+                        "Logging", "LOW", "Basic Logging Configuration",
+                        "Logging host configured but trap level not specified",
+                        line_num, line_stripped,
+                        "Configure appropriate logging level: 'logging trap informational'",
+                        {"AV": "N", "AC": "L", "PR": "H", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
+                        ["AU-3", "AU-6"],
+                        finding_type="basic_logging"
+                    )
+            
+            # Banner checks
+            if not any(re.search(r'banner\s+(login|motd)', config_line, re.IGNORECASE) for config_line in self.config_lines):
+                if line_num == len(self.config_lines):  # Only check once at end
+                    self.add_finding(
+                        "Access Control", "LOW", "Missing Login Banner",
+                        "No login banner configured to warn unauthorized users",
+                        1, "Configuration",
+                        "Configure login banner: 'banner login ^C Unauthorized access prohibited ^C'",
+                        {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "N", "I": "L", "A": "N"},
+                        ["AC-8"],
+                        finding_type="missing_banner"
+                    )
+            
+            # Service checks - additional
+            if re.search(r'service\s+tcp-small-servers', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "MEDIUM", "TCP Small Servers Enabled",
+                    "TCP small servers provide unnecessary attack vectors",
+                    line_num, line_stripped,
+                    "Disable TCP small servers: 'no service tcp-small-servers'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "L"},
+                    ["CM-7"],
+                    finding_type="no_small_servers"
+                )
+            
+            if re.search(r'service\s+udp-small-servers', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "MEDIUM", "UDP Small Servers Enabled",
+                    "UDP small servers provide unnecessary attack vectors",
+                    line_num, line_stripped,
+                    "Disable UDP small servers: 'no service udp-small-servers'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "L"},
+                    ["CM-7"],
+                    finding_type="no_small_servers"
+                )
+            
+            # NTP security check
+            if re.search(r'ntp\s+server\s+\d+\.\d+\.\d+\.\d+', line_stripped, re.IGNORECASE):
+                if not re.search(r'ntp\s+authenticate', '\n'.join(self.config_lines), re.IGNORECASE):
+                    self.add_finding(
+                        "System", "LOW", "NTP Authentication Disabled",
+                        "NTP server configured without authentication",
+                        line_num, line_stripped,
+                        "Enable NTP authentication: 'ntp authenticate' and 'ntp trusted-key'",
+                        {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "N", "I": "L", "A": "L"},
+                        ["SC-45"],
+                        finding_type="ntp_no_auth"
+                    )
+        
+        # Global configuration checks
+        config_text = '\n'.join(self.config_lines)
+        
+        # Check for missing service password-encryption
+        if not re.search(r'service\s+password-encryption', config_text, re.IGNORECASE):
+            self.add_finding(
+                "Authentication", "MEDIUM", "Password Encryption Disabled",
+                "Service password-encryption is not enabled",
+                1, "Global Configuration",
+                "Enable password encryption: 'service password-encryption'",
+                {"AV": "L", "AC": "L", "PR": "H", "UI": "N", "S": "U", "C": "M", "I": "N", "A": "N"},
+                ["IA-5", "CM-6"],
+                finding_type="no_password_encryption"
+            )
+        
+        # Check for missing AAA
+        if not re.search(r'aaa\s+', config_text, re.IGNORECASE):
+            self.add_finding(
+                "Authentication", "MEDIUM", "AAA Not Configured",
+                "Authentication, Authorization, and Accounting (AAA) is not configured",
+                1, "Global Configuration", 
+                "Configure AAA: 'aaa new-model' and appropriate authentication methods",
+                {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
+                ["IA-2", "AC-2", "AU-2"],
+                finding_type="aaa_auth"
+            )
+        
+        # Additional comprehensive checks
+        for line_num, line in enumerate(self.config_lines, 1):
+            line_stripped = line.strip()
+            
+            # Service checks
+            if re.search(r'service\s+pad', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "MEDIUM", "PAD Service Enabled",
+                    "Packet Assembler/Disassembler service provides unnecessary attack vector",
+                    line_num, line_stripped,
+                    "Disable PAD service: 'no service pad'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "L"},
+                    ["CM-7"],
+                    finding_type="no_service_pad"
+                )
+            
+            if re.search(r'ip\s+domain-lookup', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "LOW", "DNS Lookup Enabled", 
+                    "DNS lookup can cause CLI delays and information disclosure",
+                    line_num, line_stripped,
+                    "Disable DNS lookup: 'no ip domain-lookup'",
+                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "L"},
+                    ["CM-7"],
+                    finding_type="no_domain_lookup"
+                )
+            
+            # Additional ICMP checks
+            if re.search(r'ip\s+unreachables', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Network Services", "LOW", "ICMP Unreachables Enabled",
+                    "ICMP unreachable messages can aid network reconnaissance", 
+                    line_num, line_stripped,
+                    "Disable ICMP unreachables on external interfaces: 'no ip unreachables'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
+                    ["SC-7"],
+                    finding_type="no_unreachables"
+                )
+            
+            if re.search(r'ip\s+redirects', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Network Services", "LOW", "ICMP Redirects Enabled",
+                    "ICMP redirect messages can be used to manipulate routing tables",
+                    line_num, line_stripped, 
+                    "Disable ICMP redirects: 'no ip redirects'",
+                    {"AV": "A", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
+                    ["SC-7"],
+                    finding_type="no_redirect"
+                )
+            
+            if re.search(r'ip\s+mask-reply', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Network Services", "LOW", "ICMP Mask Reply Enabled",
+                    "ICMP mask reply messages expose network subnet information",
+                    line_num, line_stripped,
+                    "Disable ICMP mask reply: 'no ip mask-reply'", 
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
+                    ["SC-7"],
+                    finding_type="no_mask_reply"
+                )
+            
+            # FTP server check
+            if re.search(r'ftp-server', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "MEDIUM", "FTP Server Enabled",
+                    "FTP server provides unencrypted file transfer capabilities",
+                    line_num, line_stripped,
+                    "Disable FTP server or use secure alternatives like SCP/SFTP",
+                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "L", "A": "N"},
+                    ["SC-8", "CM-7"],
+                    finding_type="ftp_server"
+                )
+            
+            # SNMP version check
+            if re.search(r'snmp-server.*version\s+1', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "SNMP", "HIGH", "SNMP Version 1 Enabled",
+                    "SNMP version 1 has security vulnerabilities and should be disabled",
+                    line_num, line_stripped,
+                    "Use SNMP version 3 or disable: 'no snmp-server enable traps'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "L", "A": "N"},
+                    ["AC-3", "IA-2"],
+                    finding_type="snmp_ver_1"
+                )
+            
+            # Check for IPv6 enabled
+            if re.search(r'ipv6\s+(enable|unicast-routing)', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Network Services", "LOW", "IPv6 Enabled",
+                    "IPv6 is enabled which may introduce additional attack vectors if not properly secured",
+                    line_num, line_stripped,
+                    "Disable IPv6 if not required or ensure proper IPv6 security controls",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
+                    ["SC-7", "CM-6"],
+                    finding_type="ipv6_is_enabled"
+                )
+    
+    def _analyze_juniper_junos(self):
+        for line_num, line in enumerate(self.config_lines, 1):
+            line_stripped = line.strip()
+            
+            if re.search(r'set\s+system\s+services\s+telnet', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "HIGH", "Telnet Service Enabled",
+                    "Telnet service enabled on management interface",
+                    line_num, line_stripped,
+                    "Disable telnet: 'delete system services telnet'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
+                    ["SC-8", "CM-7"]
+                )
+                
+    def _analyze_fortinet_fortios(self):
+        for line_num, line in enumerate(self.config_lines, 1):
+            line_stripped = line.strip()
+            
+            if re.search(r'set\s+password\s+\w{1,8}$', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Authentication", "MEDIUM", "Weak Password",
+                    "Administrative password appears to be weak",
+                    line_num, line_stripped,
+                    "Use strong password policy with minimum 12 characters",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "L", "A": "N"},
+                    ["IA-5"]
+                )
+                
+    def _analyze_paloalto_panos(self):
+        for line_num, line in enumerate(self.config_lines, 1):
+            line_stripped = line.strip()
+            
+            if re.search(r'set\s+deviceconfig\s+system\s+service\s+disable-telnet\s+no', line_stripped, re.IGNORECASE):
+                self.add_finding(
+                    "Services", "HIGH", "Telnet Service Enabled",
+                    "Telnet management access is enabled",
+                    line_num, line_stripped,
+                    "Disable telnet: 'set deviceconfig system service disable-telnet yes'",
+                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
+                    ["SC-8", "CM-7"]
+                )
+    
+    def add_finding(self, category: str, severity: str, title: str, description: str,
+                   line_num: int, config_line: str, recommendation: str,
+                   cvss_vector_components: Dict[str, str], nist_controls: List[str],
+                   source: str = "automated", finding_type: Optional[str] = None) -> None:
+        
+        cvss_score, cvss_vector = CVSSCalculator.calculate_base_score(
+            cvss_vector_components["AV"], cvss_vector_components["AC"],
+            cvss_vector_components["PR"], cvss_vector_components["UI"],
+            cvss_vector_components["S"], cvss_vector_components["C"],
+            cvss_vector_components["I"], cvss_vector_components["A"]
+        )
+        
+        finding_id = f"{category.upper().replace(' ', '_')}_{len(self.findings) + 1}"
+        cva_id = self.cva_mappings.get(finding_type) if finding_type else None
+        
         finding = Finding(
+            id=finding_id,
             category=category,
             severity=severity,
             title=title,
@@ -320,225 +626,46 @@ class MultiVendorAnalyzer:
             cvss_vector=cvss_vector,
             nist_controls=nist_controls,
             vendor=self.vendor.value,
-            source=source
+            source=source,
+            cva_id=cva_id
         )
-        
-        # Enrich with knowledge base data if available
-        if kb_finding:
-            finding.kb_finding_id = kb_finding.finding_id
-            finding.organizational_context = kb_finding.organizational_context
-            finding.historical_incidents = kb_finding.historical_incidents
-            finding.business_impact = kb_finding.business_impact
-            finding.remediation_priority = kb_finding.remediation_priority
-            finding.custom_tags = kb_finding.custom_tags
-            finding.source = "enriched"
-            
-            # Override with KB data if more specific
-            if kb_finding.cvss_score > 0:
-                finding.cvss_score = kb_finding.cvss_score
-            if kb_finding.custom_recommendation:
-                finding.recommendation = kb_finding.custom_recommendation
         
         self.findings.append(finding)
     
-    def check_knowledge_base_matches(self) -> None:
-        """Check configuration lines against knowledge base and add KB-only findings"""
-        if not self.knowledge_base:
-            return
-        
-        matched_kb_findings = set()
-        
-        # Check each config line for KB matches
-        for i, line in enumerate(self.config_lines, 1):
-            line_clean = line.strip()
-            if not line_clean or line_clean.startswith('!'):
-                continue
-                
-            kb_match = self.knowledge_base.match_config_line(line_clean, self.vendor)
-            if kb_match:
-                matched_kb_findings.add(kb_match.finding_id)
-                
-                # Check if we already have an automated finding for this line
-                existing_finding = None
-                for finding in self.findings:
-                    if finding.line_number == i:
-                        existing_finding = finding
-                        break
-                
-                if existing_finding:
-                    # Enrich existing automated finding
-                    existing_finding.kb_finding_id = kb_match.finding_id
-                    existing_finding.organizational_context = kb_match.organizational_context
-                    existing_finding.historical_incidents = kb_match.historical_incidents
-                    existing_finding.business_impact = kb_match.business_impact
-                    existing_finding.remediation_priority = kb_match.remediation_priority
-                    existing_finding.custom_tags = kb_match.custom_tags
-                    existing_finding.source = "enriched"
-                    
-                    if kb_match.cvss_score > 0:
-                        existing_finding.cvss_score = kb_match.cvss_score
-                    if kb_match.custom_recommendation:
-                        existing_finding.recommendation = kb_match.custom_recommendation
-                else:
-                    # Create new KB-only finding
-                    self.add_finding(
-                        kb_match.category, kb_match.severity, kb_match.title,
-                        kb_match.description, i, line_clean, 
-                        kb_match.custom_recommendation or "See organizational knowledge base",
-                        {
-                            'attack_vector': 'L', 'attack_complexity': 'L',
-                            'privileges_required': 'L', 'user_interaction': 'N',
-                            'scope': 'U', 'confidentiality': 'L',
-                            'integrity': 'L', 'availability': 'L'
-                        },
-                        kb_match.nist_controls, "knowledge_base", "kb_finding", kb_match
-                    )
+    def _apply_cva_mappings(self):
+        for finding in self.findings:
+            finding_key = finding.title.lower().replace(" ", "_").replace("-", "_")
+            if finding_key in self.cva_mappings:
+                finding.cva_id = self.cva_mappings[finding_key]
 
-    # Previous check methods remain the same but now call check_knowledge_base_matches
-    def check_cisco_passwords(self) -> None:
-        """Check Cisco password configurations"""
-        for i, line in enumerate(self.config_lines, 1):
-            line_clean = line.strip()
-            
-            # Type 7 password encryption
-            if re.search(r'password 7 ', line_clean):
-                self.add_finding(
-                    "Authentication", Severity.HIGH.value,
-                    "Weak Password Encryption (Type 7)",
-                    "Type 7 passwords use reversible encryption",
-                    i, line_clean,
-                    "Use 'service password-encryption' with Type 5/8/9 encryption",
-                    {
-                        'attack_vector': 'L', 'attack_complexity': 'L',
-                        'privileges_required': 'L', 'user_interaction': 'N',
-                        'scope': 'U', 'confidentiality': 'H',
-                        'integrity': 'H', 'availability': 'N'
-                    },
-                    ['IA-5', 'CM-6']
-                )
-            
-            # Plaintext passwords
-            if re.search(r'password [^7589]\w+', line_clean):
-                self.add_finding(
-                    "Authentication", Severity.CRITICAL.value,
-                    "Plaintext Password",
-                    "Password stored in plaintext, easily readable",
-                    i, line_clean,
-                    "Use 'secret' command with strong encryption",
-                    {
-                        'attack_vector': 'L', 'attack_complexity': 'L',
-                        'privileges_required': 'N', 'user_interaction': 'N',
-                        'scope': 'C', 'confidentiality': 'H',
-                        'integrity': 'H', 'availability': 'H'
-                    },
-                    ['IA-5', 'AC-2', 'CM-6']
-                )
-            
-            # Default passwords
-            default_passwords = ['cisco', 'admin', 'password', '123456', 'secret']
-            for pwd in default_passwords:
-                if pwd.lower() in line_clean.lower() and ('password' in line_clean or 'secret' in line_clean):
-                    self.add_finding(
-                        "Authentication", Severity.CRITICAL.value,
-                        "Default Password",
-                        f"Default password '{pwd}' detected",
-                        i, line_clean,
-                        "Change to complex, unique password immediately",
-                        {
-                            'attack_vector': 'N', 'attack_complexity': 'L',
-                            'privileges_required': 'N', 'user_interaction': 'N',
-                            'scope': 'C', 'confidentiality': 'H',
-                            'integrity': 'H', 'availability': 'H'
-                        },
-                        ['IA-5', 'AC-2', 'CM-6']
-                    )
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-change-in-production'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-    def check_cisco_services(self) -> None:
-        """Check Cisco service configurations"""
-        insecure_services = [
-            ('ip http server', 'HTTP Server', 'Unencrypted management interface', ['SC-8', 'CM-7']),
-            ('service finger', 'Finger Service', 'Information disclosure service', ['CM-7', 'SC-5']),
-            ('ip bootp server', 'BOOTP Server', 'Legacy bootstrap protocol', ['CM-7']),
-            ('ip source-route', 'IP Source Routing', 'Allows route manipulation', ['SC-7', 'CM-6']),
-            ('service tcp-small-servers', 'TCP Small Servers', 'Legacy TCP services', ['CM-7']),
-            ('service udp-small-servers', 'UDP Small Servers', 'Legacy UDP services', ['CM-7'])
-        ]
-        
-        for i, line in enumerate(self.config_lines, 1):
-            line_clean = line.strip()
-            
-            for service, title, desc, nist in insecure_services:
-                if service in line_clean and not line_clean.startswith('no '):
-                    severity = Severity.HIGH.value if 'http server' in service else Severity.MEDIUM.value
-                    cvss_impact = 'H' if 'http server' in service else 'L'
-                    
-                    self.add_finding(
-                        "Services", severity, f"Insecure Service: {title}",
-                        f"{desc}: {service}",
-                        i, line_clean,
-                        f"Disable with 'no {service}'",
-                        {
-                            'attack_vector': 'N', 'attack_complexity': 'L',
-                            'privileges_required': 'N', 'user_interaction': 'N',
-                            'scope': 'U', 'confidentiality': cvss_impact,
-                            'integrity': 'L', 'availability': 'L'
-                        },
-                        nist
-                    )
+ALLOWED_CONFIG_EXTENSIONS = {'.txt', '.cfg', '.conf', '.config', '.xml'}
 
-    def check_cisco_snmp(self) -> None:
-        """Check Cisco SNMP configurations"""
-        for i, line in enumerate(self.config_lines, 1):
-            line_clean = line.strip()
-            
-            # Default SNMP communities
-            default_communities = ['public', 'private', 'cisco', 'admin']
-            snmp_match = re.search(r'snmp-server community (\S+)', line_clean)
-            if snmp_match:
-                community = snmp_match.group(1).lower()
-                if community in default_communities:
-                    self.add_finding(
-                        "SNMP", Severity.HIGH.value,
-                        "Default SNMP Community",
-                        f"Default SNMP community '{community}' allows device access",
-                        i, line_clean,
-                        "Use complex community strings with ACL restrictions",
-                        {
-                            'attack_vector': 'N', 'attack_complexity': 'L',
-                            'privileges_required': 'N', 'user_interaction': 'N',
-                            'scope': 'U', 'confidentiality': 'H',
-                            'integrity': 'L', 'availability': 'L'
-                        },
-                        ['IA-2', 'AC-3', 'CM-6']
-                    )
+def allowed_file(filename: str, allowed_extensions: set) -> bool:
+    return '.' in filename and \
+           '.' + filename.rsplit('.', 1)[1].lower() in allowed_extensions
 
-    # Additional vendor checks (Juniper, Fortinet, Palo Alto) remain the same...
+def load_static_cva_mappings() -> Dict:
+    try:
+        with open('cva-mappings.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print("CVA mappings file not found. Using empty mappings.")
+        return {}
+    except Exception as e:
+        print(f"Error loading CVA mappings: {e}")
+        return {}
 
-    def analyze(self, config_content: str) -> List[Dict[str, Any]]:
-        """Run multi-vendor vulnerability analysis with knowledge base integration"""
-        self.findings.clear()
-        self.load_config_from_string(config_content)
-        
-        # Run automated vendor-specific checks
-        if self.vendor == Vendor.CISCO:
-            self.check_cisco_passwords()
-            self.check_cisco_services()
-            self.check_cisco_snmp()
-        # Add other vendor checks as needed...
-        
-        # Check against knowledge base
-        self.check_knowledge_base_matches()
-        
-        return [asdict(finding) for finding in self.findings]
-
-# Enhanced HTML Template with KB support
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Enterprise MCVA - Network Security Assessment with Knowledge Base</title>
+    <title>Enterprise Network Configuration Vulnerability Assessment Tool</title>
     <style>
         * {
             margin: 0;
@@ -547,736 +674,555 @@ HTML_TEMPLATE = '''
         }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background-color: #f8fafc;
-            color: #1a202c;
-            line-height: 1.6;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
         }
         
         .container {
-            max-width: 1400px;
+            max-width: 1200px;
             margin: 0 auto;
-            padding: 2rem;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
         }
         
         .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
             color: white;
-            padding: 2rem;
-            border-radius: 0.5rem;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            margin-bottom: 2rem;
+            padding: 30px;
+            text-align: center;
         }
         
         .header h1 {
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin-bottom: 0.5rem;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 300;
         }
         
         .header p {
-            font-size: 1.1rem;
+            font-size: 1.1em;
             opacity: 0.9;
         }
         
-        .card {
-            background: white;
-            border-radius: 0.5rem;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-            padding: 2rem;
-            margin-bottom: 2rem;
+        .content {
+            padding: 40px;
         }
         
         .upload-section {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 2rem;
-            margin-bottom: 2rem;
-        }
-        
-        .upload-area {
-            border: 2px dashed #cbd5e0;
-            border-radius: 0.5rem;
-            padding: 2rem;
-            text-align: center;
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 30px;
+            margin-bottom: 30px;
+            border: 2px dashed #dee2e6;
             transition: all 0.3s ease;
-            cursor: pointer;
         }
         
-        .upload-area:hover {
-            border-color: #4299e1;
-            background-color: #f7fafc;
+        .upload-section:hover {
+            border-color: #007bff;
+            transform: translateY(-2px);
         }
         
-        .upload-area.dragover {
-            border-color: #4299e1;
-            background-color: #ebf8ff;
+        .file-upload-group {
+            margin-bottom: 25px;
         }
         
-        .upload-area.kb-upload {
-            border-color: #48bb78;
+        .file-upload-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #2c3e50;
         }
         
-        .upload-area.kb-upload:hover {
-            border-color: #38a169;
-            background-color: #f0fff4;
+        .file-upload-group input[type="file"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #dee2e6;
+            border-radius: 8px;
+            background: white;
+            font-size: 16px;
+            transition: border-color 0.3s ease;
         }
         
-        .btn {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.75rem 1.5rem;
-            border-radius: 0.375rem;
-            font-weight: 500;
-            text-decoration: none;
-            transition: all 0.2s;
+        .file-upload-group input[type="file"]:focus {
+            border-color: #007bff;
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
+        }
+        
+        .file-info {
+            font-size: 0.9em;
+            color: #6c757d;
+            margin-top: 5px;
+        }
+        
+        .submit-btn {
+            background: linear-gradient(135deg, #007bff 0%, #0056b3 100%);
+            color: white;
+            padding: 15px 40px;
             border: none;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: 600;
             cursor: pointer;
-            font-size: 0.875rem;
+            transition: all 0.3s ease;
+            width: 100%;
         }
         
-        .btn-primary {
-            background: linear-gradient(135deg, #4299e1, #3182ce);
-            color: white;
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(0,123,255,0.3);
         }
         
-        .btn-secondary {
-            background-color: #718096;
-            color: white;
+        .submit-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+            transform: none;
         }
         
-        .btn-success {
-            background-color: #48bb78;
-            color: white;
+        .results-section {
+            margin-top: 40px;
         }
         
-        .finding {
-            padding: 1.5rem;
-            margin-bottom: 1rem;
-            border-radius: 0.5rem;
-            border-left: 4px solid;
-        }
-        
-        .finding.source-automated {
-            border-left-color: #4299e1;
-        }
-        
-        .finding.source-knowledge_base {
-            border-left-color: #48bb78;
-        }
-        
-        .finding.source-enriched {
-            border-left-color: #ed8936;
-            background: linear-gradient(135deg, #fff5f5 0%, #f0fff4 100%);
-        }
-        
-        .source-badge {
-            padding: 0.25rem 0.75rem;
-            border-radius: 1rem;
-            font-size: 0.75rem;
-            font-weight: 500;
-            margin-left: 0.5rem;
-        }
-        
-        .source-automated {
-            background: #bee3f8;
-            color: #2b6cb0;
-        }
-        
-        .source-knowledge_base {
-            background: #c6f6d5;
-            color: #276749;
-        }
-        
-        .source-enriched {
-            background: #fbd38d;
-            color: #c05621;
-        }
-        
-        .organizational-context {
-            background: #f7fafc;
-            border: 1px solid #e2e8f0;
-            padding: 1rem;
-            border-radius: 0.375rem;
-            margin: 1rem 0;
-        }
-        
-        .kb-info {
+        .summary-cards {
             display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 1rem;
-            margin-top: 1rem;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
         }
         
-        .kb-info-item {
-            background: #f8fafc;
-            padding: 0.75rem;
-            border-radius: 0.25rem;
-            border-left: 3px solid #48bb78;
+        .summary-card {
+            background: white;
+            padding: 25px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+            border-left: 5px solid #007bff;
         }
         
-        .kb-stats {
-            background: #c6f6d5;
-            padding: 1rem;
-            border-radius: 0.375rem;
-            margin-bottom: 1rem;
+        .summary-card h3 {
+            color: #2c3e50;
+            margin-bottom: 10px;
         }
         
-        .tabs {
-            display: flex;
-            border-bottom: 1px solid #e2e8f0;
-            margin-bottom: 1rem;
+        .summary-card .number {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #007bff;
         }
         
-        .tab {
-            padding: 0.75rem 1.5rem;
-            cursor: pointer;
-            border-bottom: 2px solid transparent;
-            transition: all 0.2s;
+        .severity-critical { border-left-color: #dc3545; }
+        .severity-critical .number { color: #dc3545; }
+        .severity-high { border-left-color: #fd7e14; }
+        .severity-high .number { color: #fd7e14; }
+        .severity-medium { border-left-color: #ffc107; }
+        .severity-medium .number { color: #ffc107; }
+        .severity-low { border-left-color: #28a745; }
+        .severity-low .number { color: #28a745; }
+        
+        .findings-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
         }
         
-        .tab.active {
-            border-bottom-color: #4299e1;
-            color: #4299e1;
+        .findings-table th {
+            background: #2c3e50;
+            color: white;
+            padding: 15px 12px;
+            text-align: left;
             font-weight: 600;
         }
         
-        .tab-content {
-            display: none;
+        .findings-table td {
+            padding: 12px;
+            border-bottom: 1px solid #dee2e6;
+            vertical-align: top;
         }
         
-        .tab-content.active {
-            display: block;
+        .findings-table tr:hover {
+            background: #f8f9fa;
         }
         
-        .hidden {
-            display: none;
+        .severity-badge {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .severity-CRITICAL {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .severity-HIGH {
+            background: #fd7e14;
+            color: white;
+        }
+        
+        .severity-MEDIUM {
+            background: #ffc107;
+            color: #212529;
+        }
+        
+        .severity-LOW {
+            background: #28a745;
+            color: white;
+        }
+        
+        .cvss-score {
+            font-weight: bold;
+            font-size: 1.1em;
+        }
+        
+        .export-section {
+            margin-top: 30px;
+            text-align: center;
+        }
+        
+        .export-btn {
+            display: inline-block;
+            margin: 0 10px;
+            padding: 12px 25px;
+            background: #28a745;
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        .export-btn:hover {
+            background: #218838;
+            transform: translateY(-2px);
         }
         
         .flash-messages {
-            margin-bottom: 2rem;
+            margin-bottom: 20px;
         }
         
         .flash-error {
-            background: #fed7d7;
-            color: #822727;
-            padding: 1rem;
-            border-radius: 0.375rem;
-            border-left: 4px solid #e53e3e;
+            background: #f8d7da;
+            color: #721c24;
+            padding: 12px;
+            border-radius: 5px;
+            border: 1px solid #f5c6cb;
         }
         
         .flash-success {
-            background: #c6f6d5;
-            color: #276749;
-            padding: 1rem;
-            border-radius: 0.375rem;
-            border-left: 4px solid #38a169;
+            background: #d4edda;
+            color: #155724;
+            padding: 12px;
+            border-radius: 5px;
+            border: 1px solid #c3e6cb;
         }
         
-        .kb-template {
-            background: #f8fafc;
-            padding: 1rem;
-            border-radius: 0.375rem;
-            margin-top: 1rem;
-            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-            font-size: 0.875rem;
-            overflow-x: auto;
+        .config-line {
+            font-family: 'Courier New', monospace;
+            background: #f8f9fa;
+            padding: 8px;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                margin: 10px;
+                border-radius: 10px;
+            }
+            
+            .header h1 {
+                font-size: 1.8em;
+            }
+            
+            .content {
+                padding: 20px;
+            }
+            
+            .findings-table {
+                font-size: 0.9em;
+            }
+            
+            .findings-table th,
+            .findings-table td {
+                padding: 8px;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <!-- Header -->
         <div class="header">
-            <h1>🛡️ Enterprise Network Security Assessment</h1>
-            <p>Multi-vendor configuration analysis with organizational knowledge base integration</p>
+            <h1>Enterprise MCVA Tool</h1>
+            <p>Multi-Vendor Configuration Vulnerability Assessment</p>
         </div>
-
-        <!-- Flash Messages -->
-        <div class="flash-messages">
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="flash-{{ category }}">{{ message }}</div>
+        
+        <div class="content">
+            {% if get_flashed_messages() %}
+                <div class="flash-messages">
+                    {% for message in get_flashed_messages() %}
+                        <div class="flash-error">{{ message }}</div>
                     {% endfor %}
-                {% endif %}
-            {% endwith %}
-        </div>
-
-        {% if not results %}
-        <!-- Upload Forms -->
-        <div class="card">
-            <h2>Upload Configuration and Knowledge Base</h2>
-            <form method="POST" enctype="multipart/form-data" id="analysisForm">
+                </div>
+            {% endif %}
+            
+            <form method="POST" enctype="multipart/form-data">
                 <div class="upload-section">
-                    <!-- Configuration Upload -->
-                    <div>
-                        <h3>Network Configuration</h3>
-                        <div class="upload-area" id="configUploadArea">
-                            <div style="font-size: 2rem; margin-bottom: 1rem;">📄</div>
-                            <p><strong>Configuration File</strong></p>
-                            <p>Cisco, Juniper, Fortinet, Palo Alto</p>
-                            <input type="file" name="config_file" id="configFileInput" accept=".txt,.cfg,.conf,.config,.xml" style="display: none;">
-                        </div>
+                    <div class="file-upload-group">
+                        <label for="config_file">Network Configuration File *</label>
+                        <input type="file" id="config_file" name="config_file" required 
+                               accept=".txt,.cfg,.conf,.config,.xml">
+                        <div class="file-info">Supported formats: .txt, .cfg, .conf, .config, .xml (Max: 16MB)</div>
                     </div>
                     
-                    <!-- Knowledge Base Upload -->
-                    <div>
-                        <h3>Knowledge Base (Optional)</h3>
-                        <div class="upload-area kb-upload" id="kbUploadArea">
-                            <div style="font-size: 2rem; margin-bottom: 1rem;">🧠</div>
-                            <p><strong>Knowledge Base File</strong></p>
-                            <p>JSON or CSV format</p>
-                            <input type="file" name="kb_file" id="kbFileInput" accept=".json,.csv" style="display: none;">
-                        </div>
-                    </div>
-                </div>
-                
-                <div style="text-align: center; margin-top: 2rem;">
-                    <button type="submit" class="btn btn-primary">🔍 Run Enhanced Assessment</button>
-                    <button type="button" class="btn btn-secondary" onclick="showKBTemplate()">📋 View KB Template</button>
+                    
+                    <button type="submit" class="submit-btn">Analyze Configuration</button>
                 </div>
             </form>
             
-            <!-- Knowledge Base Template -->
-            <div id="kbTemplate" class="hidden">
-                <h3>Knowledge Base Template</h3>
-                <p>Create your organizational knowledge base using this JSON format:</p>
-                <div class="kb-template">
-{
-  "findings": [
-    {
-      "finding_id": "ORG-001",
-      "title": "Critical Network Device Password Policy",
-      "description": "Password does not meet organizational complexity requirements",
-      "category": "Authentication", 
-      "severity": "HIGH",
-      "cvss_score": 7.5,
-      "nist_controls": ["IA-5", "AC-2"],
-      "config_patterns": ["password \\w{1,7}$", "enable password [^5]"],
-      "vendor": "Cisco IOS",
-      "organizational_context": "IT-2023-001: Mandates 12+ character passwords",
-      "historical_incidents": "2023-03: Breach via weak router password",
-      "business_impact": "Critical infrastructure access compromise",
-      "remediation_priority": "P1 - Immediate",
-      "custom_recommendation": "Update per IT-2023-001 policy within 24 hours",
-      "custom_tags": ["compliance", "critical-infra", "audit-finding"]
-    }
-  ]
-}
-                </div>
-            </div>
-        </div>
-        {% endif %}
-
-        {% if results %}
-        <!-- Results with KB Integration -->
-        <div class="card">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
-                <div>
-                    <h2>Security Assessment Results</h2>
-                    <p>Vendor: <strong>{{ results.vendor }}</strong></p>
-                </div>
-                <div style="display: flex; gap: 1rem;">
-                    <a href="{{ url_for('export_report', format='txt') }}" class="btn btn-secondary">📄 Export Report</a>
-                    <a href="{{ url_for('export_report', format='json') }}" class="btn btn-secondary">📊 Export JSON</a>
-                    <a href="{{ url_for('index') }}" class="btn btn-primary">🔄 New Analysis</a>
-                </div>
-            </div>
-
-            <!-- Enhanced Statistics with KB Info -->
-            {% if results.kb_stats %}
-            <div class="kb-stats">
-                <strong>Knowledge Base Integration:</strong>
-                {{ results.kb_stats.total_kb_findings }} KB findings loaded, 
-                {{ results.kb_stats.matched_findings }} matched with config, 
-                {{ results.kb_stats.enriched_findings }} automated findings enriched
-            </div>
-            {% endif %}
-
-            <!-- Tabbed Interface -->
-            <div class="tabs">
-                <div class="tab active" onclick="switchTab('all')">All Findings</div>
-                <div class="tab" onclick="switchTab('automated')">Automated Only</div>
-                <div class="tab" onclick="switchTab('enriched')">Enhanced by KB</div>
-                <div class="tab" onclick="switchTab('kb-only')">KB Only</div>
-            </div>
-
-            <!-- Findings by Source -->
-            {% for source_type, source_findings in results.findings_by_source.items() %}
-            <div class="tab-content" id="tab-{{ source_type }}">
-                {% if source_findings %}
-                    {% for category, findings in source_findings.items() %}
-                    <div class="category-section">
-                        <div class="category-header">
-                            {{ category }} ({{ findings|length }} findings)
+            {% if results %}
+                <div class="results-section">
+                    <h2>Assessment Results</h2>
+                    
+                    <div class="summary-cards">
+                        <div class="summary-card">
+                            <h3>Total Findings</h3>
+                            <div class="number">{{ results.summary.total_findings }}</div>
                         </div>
-                        <div class="findings-container">
-                            {% for finding in findings %}
-                            <div class="finding source-{{ finding.source }}">
-                                <div class="finding-title">
-                                    {{ finding.title }}
-                                    <span class="source-badge source-{{ finding.source }}">
-                                        {% if finding.source == 'automated' %}🤖 Automated
-                                        {% elif finding.source == 'knowledge_base' %}🧠 Knowledge Base
-                                        {% elif finding.source == 'enriched' %}✨ Enhanced
-                                        {% endif %}
-                                    </span>
-                                </div>
-                                
-                                {% if finding.kb_finding_id %}
-                                <div class="organizational-context">
-                                    <strong>🏢 Organizational Context ({{ finding.kb_finding_id }}):</strong>
-                                    {{ finding.organizational_context or 'See knowledge base entry' }}
-                                </div>
-                                {% endif %}
-                                
-                                <p>{{ finding.description }}</p>
-                                
-                                {% if finding.line_number > 0 %}
-                                <div>
-                                    <strong>Line {{ finding.line_number }}:</strong>
-                                    <div class="config-line">{{ finding.config_line }}</div>
-                                </div>
-                                {% endif %}
-                                
-                                {% if finding.source == 'enriched' or finding.source == 'knowledge_base' %}
-                                <div class="kb-info">
-                                    {% if finding.business_impact %}
-                                    <div class="kb-info-item">
-                                        <strong>💼 Business Impact:</strong><br>
-                                        {{ finding.business_impact }}
-                                    </div>
-                                    {% endif %}
-                                    
-                                    {% if finding.historical_incidents %}
-                                    <div class="kb-info-item">
-                                        <strong>📚 Historical Incidents:</strong><br>
-                                        {{ finding.historical_incidents }}
-                                    </div>
-                                    {% endif %}
-                                    
-                                    {% if finding.remediation_priority %}
-                                    <div class="kb-info-item">
-                                        <strong>🚨 Priority:</strong><br>
-                                        {{ finding.remediation_priority }}
-                                    </div>
-                                    {% endif %}
-                                    
-                                    {% if finding.custom_tags %}
-                                    <div class="kb-info-item">
-                                        <strong>🏷️ Tags:</strong><br>
-                                        {{ finding.custom_tags|join(', ') }}
-                                    </div>
-                                    {% endif %}
-                                </div>
-                                {% endif %}
-                                
-                                <div class="recommendation">
-                                    <strong>💡 Recommendation:</strong> {{ finding.recommendation }}
-                                </div>
-                            </div>
-                            {% endfor %}
+                        <div class="summary-card">
+                            <h3>Detected Vendor</h3>
+                            <div class="number" style="font-size: 1.2em;">{{ results.vendor }}</div>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Average CVSS</h3>
+                            <div class="number">{{ "%.1f"|format(results.summary.avg_cvss_score) }}</div>
                         </div>
                     </div>
-                    {% endfor %}
-                {% else %}
-                    <p>No findings of this type.</p>
-                {% endif %}
-            </div>
-            {% endfor %}
+                    
+                    {% if results.summary.severity_breakdown %}
+                        <div class="summary-cards">
+                            {% for severity, count in results.summary.severity_breakdown.items() %}
+                                <div class="summary-card severity-{{ severity.lower() }}">
+                                    <h3>{{ severity }}</h3>
+                                    <div class="number">{{ count }}</div>
+                                </div>
+                            {% endfor %}
+                        </div>
+                    {% endif %}
+                    
+                    {% if results.findings %}
+                        <table class="findings-table">
+                            <thead>
+                                <tr>
+                                    <th>Severity</th>
+                                    <th>Category</th>
+                                    <th>Title</th>
+                                    <th>CVSS</th>
+                                    <th>Line</th>
+                                    <th>CVA ID</th>
+                                    <th>Configuration</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for finding in results.findings %}
+                                <tr>
+                                    <td>
+                                        <span class="severity-badge severity-{{ finding.severity }}">
+                                            {{ finding.severity }}
+                                        </span>
+                                    </td>
+                                    <td>{{ finding.category }}</td>
+                                    <td>
+                                        <strong>{{ finding.title }}</strong><br>
+                                        <small>{{ finding.description[:100] }}{% if finding.description|length > 100 %}...{% endif %}</small>
+                                    </td>
+                                    <td>
+                                        <span class="cvss-score">{{ "%.1f"|format(finding.cvss_score) }}</span>
+                                    </td>
+                                    <td>{{ finding.line_number }}</td>
+                                    <td>{{ finding.cva_id or "-" }}</td>
+                                    <td>
+                                        <div class="config-line">{{ finding.config_line[:80] }}{% if finding.config_line|length > 80 %}...{% endif %}</div>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    {% endif %}
+                    
+                    <div class="export-section">
+                        <h3>Export Results</h3>
+                        <a href="{{ url_for('export', format='json') }}" class="export-btn">Export JSON</a>
+                        <a href="{{ url_for('export', format='txt') }}" class="export-btn">Export Text</a>
+                    </div>
+                </div>
+            {% endif %}
         </div>
-        {% endif %}
     </div>
-
+    
     <script>
-        // File upload handling
-        function setupUploadArea(areaId, inputId) {
-            const uploadArea = document.getElementById(areaId);
-            const fileInput = document.getElementById(inputId);
-            
-            uploadArea.addEventListener('click', () => fileInput.click());
-            
-            uploadArea.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                uploadArea.classList.add('dragover');
-            });
-            
-            uploadArea.addEventListener('dragleave', () => {
-                uploadArea.classList.remove('dragover');
-            });
-            
-            uploadArea.addEventListener('drop', (e) => {
-                e.preventDefault();
-                uploadArea.classList.remove('dragover');
-                fileInput.files = e.dataTransfer.files;
-                if (fileInput.files.length > 0) {
-                    uploadArea.innerHTML = `<div style="font-size: 2rem; margin-bottom: 1rem;">✅</div><p><strong>Selected: ${fileInput.files[0].name}</strong></p>`;
-                }
-            });
-            
-            fileInput.addEventListener('change', () => {
-                if (fileInput.files.length > 0) {
-                    uploadArea.innerHTML = `<div style="font-size: 2rem; margin-bottom: 1rem;">✅</div><p><strong>Selected: ${fileInput.files[0].name}</strong></p>`;
-                }
-            });
-        }
+        document.getElementById('config_file').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file && file.size > 16 * 1024 * 1024) {
+                alert('File size exceeds 16MB limit');
+                e.target.value = '';
+            }
+        });
         
-        setupUploadArea('configUploadArea', 'configFileInput');
-        setupUploadArea('kbUploadArea', 'kbFileInput');
-        
-        function switchTab(tabType) {
-            // Hide all tab contents
-            document.querySelectorAll('.tab-content').forEach(content => {
-                content.classList.remove('active');
-            });
-            
-            // Remove active class from all tabs
-            document.querySelectorAll('.tab').forEach(tab => {
-                tab.classList.remove('active');
-            });
-            
-            // Show selected tab content
-            if (tabType === 'all') {
-                document.querySelectorAll('.tab-content').forEach(content => {
-                    content.classList.add('active');
-                });
-            } else {
-                document.getElementById('tab-' + tabType).classList.add('active');
+        const form = document.querySelector('form');
+        form.addEventListener('submit', function(e) {
+            const configFile = document.getElementById('config_file').files[0];
+            if (!configFile) {
+                e.preventDefault();
+                alert('Please select a configuration file');
+                return;
             }
             
-            // Add active class to clicked tab
-            event.target.classList.add('active');
-        }
-        
-        function showKBTemplate() {
-            const template = document.getElementById('kbTemplate');
-            template.classList.toggle('hidden');
-        }
+            const submitBtn = document.querySelector('.submit-btn');
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Analyzing...';
+        });
     </script>
 </body>
 </html>
 '''
 
-# Enhanced Flask Routes
-@app.route('/')
+@app.route('/', methods=['GET', 'POST'])
 def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/', methods=['POST'])
-def upload_file():
+    if request.method == 'GET':
+        return render_template_string(HTML_TEMPLATE)
+    
     if 'config_file' not in request.files:
-        flash('No configuration file selected', 'error')
-        return redirect(request.url)
+        flash('No configuration file selected')
+        return redirect(url_for('index'))
     
     config_file = request.files['config_file']
     if config_file.filename == '':
-        flash('No configuration file selected', 'error')
-        return redirect(request.url)
-    
-    # Load knowledge base if provided
-    knowledge_base = None
-    if 'kb_file' in request.files and request.files['kb_file'].filename != '':
-        kb_file = request.files['kb_file']
-        try:
-            kb_content = kb_file.read().decode('utf-8')
-            knowledge_base = KnowledgeBaseManager()
-            
-            if kb_file.filename.endswith('.json'):
-                knowledge_base.load_from_json(kb_content)
-            elif kb_file.filename.endswith('.csv'):
-                knowledge_base.load_from_csv(kb_content)
-            else:
-                flash('Knowledge base must be JSON or CSV format', 'error')
-                return redirect(request.url)
-                
-            flash(f'Knowledge base loaded: {len(knowledge_base.findings)} findings', 'success')
-        except Exception as e:
-            flash(f'Error loading knowledge base: {str(e)}', 'error')
-            return redirect(request.url)
-    
-    try:
-        # Read configuration file
-        config_content = config_file.read().decode('utf-8')
-        
-        # Analyze with knowledge base integration
-        analyzer = MultiVendorAnalyzer(knowledge_base)
-        findings = analyzer.analyze(config_content)
-        
-        # Process results with source categorization
-        findings_by_source = {
-            'all': {},
-            'automated': {},
-            'knowledge_base': {},
-            'enriched': {}
-        }
-        
-        kb_stats = {
-            'total_kb_findings': len(knowledge_base.findings) if knowledge_base else 0,
-            'matched_findings': 0,
-            'enriched_findings': 0
-        }
-        
-        for finding in findings:
-            # Categorize by source
-            source = finding['source']
-            category = finding['category']
-            
-            # Add to 'all' and specific source
-            for group in ['all', source]:
-                if category not in findings_by_source[group]:
-                    findings_by_source[group][category] = []
-                findings_by_source[group][category].append(finding)
-            
-            # Update KB stats
-            if finding['source'] == 'enriched':
-                kb_stats['enriched_findings'] += 1
-            if finding['kb_finding_id']:
-                kb_stats['matched_findings'] += 1
-        
-        results = {
-            'findings': findings,
-            'findings_by_source': findings_by_source,
-            'vendor': analyzer.vendor.value,
-            'kb_stats': kb_stats if knowledge_base else None,
-            'filename': secure_filename(config_file.filename),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # Store results in session
-        session['results'] = results
-        
-        total_findings = len(findings)
-        kb_enhanced = kb_stats['enriched_findings'] + kb_stats['matched_findings']
-        
-        if total_findings == 0:
-            flash(f'Analysis complete! No security issues found in {analyzer.vendor.value} configuration.', 'success')
-        else:
-            msg = f'Analysis complete! {total_findings} findings in {analyzer.vendor.value} configuration'
-            if knowledge_base:
-                msg += f', {kb_enhanced} enhanced by knowledge base'
-            flash(msg, 'success')
-        
-        return render_template_string(HTML_TEMPLATE, results=results)
-        
-    except Exception as e:
-        flash(f'Error during analysis: {str(e)}', 'error')
-        return redirect(request.url)
-
-@app.route('/export/<format>')
-def export_report(format):
-    if 'results' not in session:
-        flash('No analysis results to export', 'error')
+        flash('No file selected')
         return redirect(url_for('index'))
     
-    results = session['results']
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if not allowed_file(config_file.filename, ALLOWED_CONFIG_EXTENSIONS):
+        flash('Invalid file format. Please upload .txt, .cfg, .conf, .config, or .xml files')
+        return redirect(url_for('index'))
+    
+    try:
+        config_content = config_file.read().decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            config_file.seek(0)
+            config_content = config_file.read().decode('latin-1')
+        except UnicodeDecodeError:
+            flash('Unable to read file. Please ensure it is a text file with proper encoding')
+            return redirect(url_for('index'))
+    
+    cva_mappings = load_static_cva_mappings()
+    analyzer = MultiVendorAnalyzer(cva_mappings=cva_mappings)
+    findings_data = analyzer.analyze(config_content)
+    
+    severity_breakdown = {}
+    total_cvss = 0
+    for finding_dict in findings_data:
+        severity = finding_dict["severity"]
+        severity_breakdown[severity] = severity_breakdown.get(severity, 0) + 1
+        total_cvss += finding_dict["cvss_score"]
+    
+    avg_cvss = total_cvss / len(findings_data) if findings_data else 0
+    
+    results = {
+        "summary": {
+            "total_findings": len(findings_data),
+            "severity_breakdown": severity_breakdown,
+            "avg_cvss_score": avg_cvss
+        },
+        "vendor": analyzer.vendor.value,
+        "timestamp": datetime.now().isoformat(),
+        "findings": findings_data,
+        "cva_stats": {
+            "loaded": len(cva_mappings) > 0,
+            "mappings_count": len(cva_mappings)
+        }
+    }
+    
+    session['last_results'] = results
+    
+    return render_template_string(HTML_TEMPLATE, results=results)
+
+@app.route('/export/<format>')
+def export(format):
+    if 'last_results' not in session:
+        flash('No analysis results available for export')
+        return redirect(url_for('index'))
+    
+    results = session['last_results']
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     if format == 'json':
-        json_data = json.dumps(results, indent=2)
-        temp_file = io.BytesIO()
-        temp_file.write(json_data.encode('utf-8'))
-        temp_file.seek(0)
-        
-        return send_file(
-            temp_file,
-            as_attachment=True,
-            download_name=f'mcva_kb_report_{timestamp}.json',
-            mimetype='application/json'
-        )
+        response = make_response(json.dumps(results, indent=2))
+        response.headers['Content-Type'] = 'application/json'
+        response.headers['Content-Disposition'] = f'attachment; filename=mcva_results_{timestamp}.json'
+        return response
     
     elif format == 'txt':
-        # Enhanced text report with KB integration
-        lines = []
-        lines.append('=' * 100)
-        lines.append('ENTERPRISE NETWORK SECURITY ASSESSMENT WITH KNOWLEDGE BASE INTEGRATION')
-        lines.append('=' * 100)
-        lines.append(f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-        lines.append(f'Configuration: {results.get("filename", "N/A")}')
-        lines.append(f'Vendor: {results.get("vendor", "Unknown")}')
+        output = []
+        output.append("ENTERPRISE NETWORK SECURITY ASSESSMENT REPORT")
+        output.append("=" * 50)
+        output.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        output.append(f"Vendor: {results['vendor']}")
+        output.append(f"Average CVSS: {results['summary']['avg_cvss_score']:.1f}")
+        output.append("")
         
-        if results.get('kb_stats'):
-            lines.append(f'Knowledge Base: {results["kb_stats"]["total_kb_findings"]} findings loaded')
-            lines.append(f'KB Matches: {results["kb_stats"]["matched_findings"]} findings matched')
-            lines.append(f'Enhanced: {results["kb_stats"]["enriched_findings"]} findings enriched')
-        lines.append('')
+        output.append("EXECUTIVE SUMMARY")
+        output.append("-" * 17)
+        output.append(f"Total Findings: {results['summary']['total_findings']}")
         
-        # Report by source type
-        for source_type, source_findings in results['findings_by_source'].items():
-            if source_type == 'all':
-                continue
-                
-            lines.append(f'\n{source_type.upper().replace("_", " ")} FINDINGS')
-            lines.append('-' * (len(source_type) + 10))
+        for severity, count in results['summary']['severity_breakdown'].items():
+            output.append(f"{severity}: {count}")
+        output.append("")
+        
+        if results['cva_stats']['loaded']:
+            output.append("CVA MAPPINGS")
+            output.append("-" * 12)
+            cva_counts = {}
+            for finding in results['findings']:
+                if finding.get('cva_id'):
+                    cva_counts[finding['cva_id']] = cva_counts.get(finding['cva_id'], 0) + 1
             
-            if not source_findings:
-                lines.append('No findings of this type.')
-                continue
-                
-            for category, findings in source_findings.items():
-                lines.append(f'\n{category} ({len(findings)} findings)')
-                lines.append('=' * (len(category) + 15))
-                
-                for i, finding in enumerate(findings, 1):
-                    lines.append(f'\n{i}. {finding["title"]} [{finding["severity"]}]')
-                    
-                    if finding.get('kb_finding_id'):
-                        lines.append(f'   KB ID: {finding["kb_finding_id"]}')
-                    
-                    lines.append(f'   Description: {finding["description"]}')
-                    
-                    if finding.get('organizational_context'):
-                        lines.append(f'   Organizational Context: {finding["organizational_context"]}')
-                    
-                    if finding.get('business_impact'):
-                        lines.append(f'   Business Impact: {finding["business_impact"]}')
-                    
-                    if finding.get('historical_incidents'):
-                        lines.append(f'   Historical Incidents: {finding["historical_incidents"]}')
-                        
-                    if finding.get('remediation_priority'):
-                        lines.append(f'   Priority: {finding["remediation_priority"]}')
-                    
-                    if finding["line_number"] > 0:
-                        lines.append(f'   Line {finding["line_number"]}: {finding["config_line"]}')
-                    
-                    lines.append(f'   Recommendation: {finding["recommendation"]}')
-                    
-                    if finding.get('custom_tags'):
-                        lines.append(f'   Tags: {", ".join(finding["custom_tags"])}')
+            for cva_id, count in cva_counts.items():
+                output.append(f"{cva_id}: {count} findings")
+            output.append("")
         
-        report_text = '\n'.join(lines)
-        temp_file = io.BytesIO()
-        temp_file.write(report_text.encode('utf-8'))
-        temp_file.seek(0)
+        output.append("DETAILED FINDINGS")
+        output.append("-" * 17)
         
-        return send_file(
-            temp_file,
-            as_attachment=True,
-            download_name=f'mcva_kb_report_{timestamp}.txt',
-            mimetype='text/plain'
-        )
+        for finding in results['findings']:
+            output.append(f"[{finding['severity']}] {finding['title']}")
+            output.append(f"  Category: {finding['category']}")
+            output.append(f"  CVSS: {finding['cvss_score']:.1f} ({finding['cvss_vector']})")
+            output.append(f"  Line {finding['line_number']}: {finding['config_line']}")
+            output.append(f"  Description: {finding['description']}")
+            output.append(f"  Recommendation: {finding['recommendation']}")
+            output.append(f"  NIST Controls: {', '.join(finding['nist_controls'])}")
+            if finding.get('cva_id'):
+                output.append(f"  CVA ID: {finding['cva_id']}")
+            if finding.get('organizational_context'):
+                output.append(f"  Org Context: {finding['organizational_context']}")
+            output.append("")
+        
+        response = make_response('\n'.join(output))
+        response.headers['Content-Type'] = 'text/plain'
+        response.headers['Content-Disposition'] = f'attachment; filename=mcva_report_{timestamp}.txt'
+        return response
     
-    flash('Invalid export format', 'error')
+    flash('Invalid export format')
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    print("=" * 100)
-    print("🛡️  ENTERPRISE NETWORK SECURITY ASSESSMENT WITH KNOWLEDGE BASE INTEGRATION")
-    print("=" * 100)
-    print("Features:")
-    print("  ✅ Multi-vendor configuration analysis")
-    print("  ✅ NIST 800-53 control mapping")
-    print("  ✅ CVSS v3.1 risk scoring")
-    print("  ✅ Organizational knowledge base integration")
-    print("  ✅ Enhanced findings with institutional context")
-    print("  ✅ Professional reporting with source attribution")
-    print()
-    print("🧠 Knowledge Base Formats:")
-    print("  📄 JSON: Structured finding definitions")
-    print("  📊 CSV: Tabular finding data")
-    print()
-    print("🌐 Access: http://localhost:5000")
-    print("🔧 Press Ctrl+C to stop")
-    print("=" * 100)
     app.run(debug=True, host='0.0.0.0', port=5000)
