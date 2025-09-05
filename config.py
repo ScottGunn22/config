@@ -13,6 +13,9 @@ from tempfile import TemporaryFile
 from flask import Flask, request, render_template_string, jsonify, session, flash, redirect, url_for, make_response
 from werkzeug.utils import secure_filename
 
+# Import the improved multi-vendor analyzer
+from improved_parser_example import MultiVendorAnalyzer as ImprovedAnalyzer
+
 class Vendor(Enum):
     CISCO_IOS = "Cisco IOS"
     JUNIPER_JUNOS = "Juniper JUNOS" 
@@ -659,6 +662,95 @@ def load_static_cva_mappings() -> Dict:
         print(f"Error loading CVA mappings: {e}")
         return {}
 
+def map_finding_to_cva(finding: Dict[str, Any], cva_mappings: Dict[str, str]) -> Optional[str]:
+    """
+    Smart mapping function to match findings to CVA IDs using regex and fuzzy matching
+    """
+    if not cva_mappings:
+        return None
+    
+    title = finding.get('title', '').lower()
+    description = finding.get('description', '').lower()
+    config_object = finding.get('config_object', '').lower()
+    
+    # Direct mapping rules based on CVA keys and finding patterns
+    mapping_rules = {
+        # Authentication and Password Issues
+        'cisco_type_7_pass': r'(type 7|password 7|weak.*password.*encrypt)',
+        'pass_enc': r'(plain.*text.*password|password 0|service.*password.*encrypt)',
+        'enable_secret': r'(enable.*password|enable.*secret)',
+        'default_password': r'(default.*password|weak.*password|cisco|admin|password)',
+        
+        # Network Services
+        'no_http_https': r'(http.*server|http.*without.*https|web.*management.*http)',
+        'no_finger': r'(finger.*service|service.*finger)',
+        'no_bootp': r'(bootp.*server|ip.*bootp)',
+        'no_source_route': r'(source.*routing|ip.*source.*route)',
+        'transport_input': r'(transport.*input|telnet.*access|ssh.*protocol)',
+        'no_domain_lookup': r'(domain.*lookup|dns.*server)',
+        
+        # SNMP Issues
+        'no_snmp_server_ro_rw': r'(snmp.*community|snmp.*write.*access|public|private)',
+        'snmp_ver_1': r'(snmp.*version.*1)',
+        'default_password': r'(snmp.*community.*(public|private))',
+        
+        # Network Security
+        'no_proxy_arp': r'(proxy.*arp)',
+        'no_directed_broadcast': r'(directed.*broadcast)',
+        'no_unreachables': r'(unreachable|icmp.*unreachable)',
+        'no_redirect': r'(redirect|icmp.*redirect)',
+        'no_mask_reply': r'(mask.*reply|icmp.*mask)',
+        'cdp_cisco': r'(cdp|cisco.*discovery)',
+        
+        # Access Control and Security
+        'session_timeout': r'(timeout|exec.*timeout|session.*timeout)',
+        'aaa_auth': r'(aaa|authentication.*authorization)',
+        'no_acl_mgmt': r'(access.*control.*list|acl.*missing|overly.*permissive)',
+        
+        # System Security
+        'outdated_ios': r'(software.*version|ios.*version|outdated)',
+        'ipv6_is_enabled': r'(ipv6.*enabled)',
+        
+        # Logging
+        'snmp_trap': r'(logging|syslog|trap.*level)',
+        
+        # Services
+        'no_small_servers': r'(small.*server|tcp.*small|udp.*small)',
+        'no_service_pad': r'(pad.*service|service.*pad)',
+        'ftp_server': r'(ftp.*server)',
+        
+        # Misc
+        'ntp_disable': r'(ntp|network.*time)',
+        'syn_flood_prev': r'(tcp.*keepalive|syn.*flood)',
+    }
+    
+    # Try to match using the mapping rules
+    for cva_key, pattern in mapping_rules.items():
+        if re.search(pattern, title) or re.search(pattern, description) or re.search(pattern, config_object):
+            if cva_key in cva_mappings:
+                return cva_mappings[cva_key]
+    
+    # Fallback: try direct key matching with various transformations
+    potential_keys = [
+        title.replace(' ', '_').replace('-', '_'),
+        title.replace(' ', '').replace('-', '').lower(),
+        '_'.join(title.split()[:2]),  # First two words
+    ]
+    
+    for key in potential_keys:
+        if key in cva_mappings:
+            return cva_mappings[key]
+    
+    # Additional specific mappings based on configuration content
+    if 'banner' in title.lower():
+        return cva_mappings.get('banner_advertises_service_version')
+    elif 'classless' in title.lower():
+        return cva_mappings.get('no_directed_broadcast')  # Similar routing issue
+    elif 'minimum password' in title.lower():
+        return cva_mappings.get('default_password')
+    
+    return None
+
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -1062,6 +1154,7 @@ HTML_TEMPLATE = '''
                         <h3>Export Results</h3>
                         <a href="{{ url_for('export', format='json') }}" class="export-btn">Export JSON</a>
                         <a href="{{ url_for('export', format='txt') }}" class="export-btn">Export Text</a>
+                        <a href="{{ url_for('export', format='html') }}" class="export-btn" style="background: #17a2b8;">Export HTML</a>
                     </div>
                 </div>
             {% endif %}
@@ -1123,9 +1216,40 @@ def index():
             flash('Unable to read file. Please ensure it is a text file with proper encoding')
             return redirect(url_for('index'))
     
+    # Load CVA mappings for internal finding numbers
     cva_mappings = load_static_cva_mappings()
-    analyzer = MultiVendorAnalyzer(cva_mappings=cva_mappings)
-    findings_data = analyzer.analyze(config_content)
+    
+    # Use the improved multi-vendor analyzer
+    improved_analyzer = ImprovedAnalyzer()
+    analysis_results = improved_analyzer.analyze_configuration(config_content)
+    
+    if 'error' in analysis_results:
+        flash(f'Analysis error: {analysis_results["error"]}')
+        return redirect(url_for('index'))
+    
+    # Convert improved analyzer results to match expected format and apply CVA mappings
+    findings_data = []
+    for finding_dict in analysis_results['findings']:
+        # Smart CVA mapping using regex and fuzzy matching
+        cva_id = map_finding_to_cva(finding_dict, cva_mappings) if cva_mappings else None
+        
+        # Map the improved format to the web app format
+        findings_data.append({
+            'id': finding_dict['id'],
+            'category': finding_dict['category'],
+            'severity': finding_dict['severity'],
+            'title': finding_dict['title'],
+            'description': finding_dict['description'],
+            'line_number': 1,  # Improved analyzer doesn't track line numbers the same way
+            'config_line': finding_dict['config_object'],
+            'recommendation': finding_dict['recommendation'],
+            'cvss_score': finding_dict['cvss_score'],
+            'cvss_vector': finding_dict['cvss_vector'],
+            'nist_controls': finding_dict['nist_controls'],
+            'vendor': analysis_results['vendor'],
+            'source': 'automated',
+            'cva_id': cva_id
+        })
     
     severity_breakdown = {}
     total_cvss = 0
@@ -1142,7 +1266,7 @@ def index():
             "severity_breakdown": severity_breakdown,
             "avg_cvss_score": avg_cvss
         },
-        "vendor": analyzer.vendor.value,
+        "vendor": analysis_results['vendor'].title(),
         "timestamp": datetime.now().isoformat(),
         "findings": findings_data,
         "cva_stats": {
@@ -1221,8 +1345,403 @@ def export(format):
         response.headers['Content-Disposition'] = f'attachment; filename=mcva_report_{timestamp}.txt'
         return response
     
+    elif format == 'html':
+        html_content = generate_html_report(results, timestamp)
+        response = make_response(html_content)
+        response.headers['Content-Type'] = 'text/html'
+        response.headers['Content-Disposition'] = f'attachment; filename=mcva_report_{timestamp}.html'
+        return response
+    
     flash('Invalid export format')
     return redirect(url_for('index'))
+
+def generate_html_report(results: Dict, timestamp: str) -> str:
+    """Generate a comprehensive HTML report similar to nipper-ng output"""
+    
+    severity_colors = {
+        'CRITICAL': '#dc3545',
+        'HIGH': '#fd7e14', 
+        'MEDIUM': '#ffc107',
+        'LOW': '#28a745'
+    }
+    
+    # Group findings by category
+    findings_by_category = {}
+    for finding in results['findings']:
+        category = finding['category']
+        if category not in findings_by_category:
+            findings_by_category[category] = []
+        findings_by_category[category].append(finding)
+    
+    html_content = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Vendor Configuration Vulnerability Assessment Report</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f8f9fa;
+            line-height: 1.6;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            overflow: hidden;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }}
+        .header h1 {{
+            font-size: 2.5em;
+            margin: 0 0 10px 0;
+            font-weight: 300;
+        }}
+        .header .subtitle {{
+            font-size: 1.2em;
+            opacity: 0.9;
+        }}
+        .content {{
+            padding: 40px;
+        }}
+        .summary-section {{
+            background: #f8f9fa;
+            padding: 30px;
+            margin-bottom: 40px;
+            border-radius: 8px;
+            border-left: 5px solid #007bff;
+        }}
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }}
+        .summary-item {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }}
+        .summary-item h3 {{
+            margin: 0 0 10px 0;
+            color: #2c3e50;
+        }}
+        .summary-item .value {{
+            font-size: 2em;
+            font-weight: bold;
+            color: #007bff;
+        }}
+        .severity-breakdown {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }}
+        .severity-item {{
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }}
+        .severity-item .count {{
+            font-size: 1.8em;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }}
+        .severity-item .label {{
+            font-size: 0.9em;
+            font-weight: 600;
+            text-transform: uppercase;
+        }}
+        .section {{
+            margin: 40px 0;
+        }}
+        .section h2 {{
+            color: #2c3e50;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 10px;
+            margin-bottom: 30px;
+        }}
+        .finding {{
+            background: white;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            overflow: hidden;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        }}
+        .finding-header {{
+            background: #f8f9fa;
+            padding: 15px 20px;
+            border-bottom: 1px solid #dee2e6;
+        }}
+        .finding-title {{
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #2c3e50;
+            margin: 0;
+        }}
+        .finding-meta {{
+            display: flex;
+            gap: 20px;
+            margin-top: 8px;
+            font-size: 0.9em;
+        }}
+        .severity-badge {{
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: white;
+        }}
+        .finding-body {{
+            padding: 20px;
+        }}
+        .finding-section {{
+            margin-bottom: 15px;
+        }}
+        .finding-section h4 {{
+            margin: 0 0 8px 0;
+            color: #495057;
+            font-size: 0.95em;
+            font-weight: 600;
+            text-transform: uppercase;
+        }}
+        .config-code {{
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-left: 4px solid #007bff;
+            padding: 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            margin: 8px 0;
+            border-radius: 4px;
+        }}
+        .cvss-score {{
+            background: #e9ecef;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.9em;
+            margin: 8px 0;
+        }}
+        .nist-controls {{
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin: 8px 0;
+        }}
+        .nist-control {{
+            background: #007bff;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: 500;
+        }}
+        .footer {{
+            background: #2c3e50;
+            color: white;
+            padding: 20px;
+            text-align: center;
+            font-size: 0.9em;
+        }}
+        .toc {{
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }}
+        .toc h3 {{
+            margin-top: 0;
+            color: #2c3e50;
+        }}
+        .toc ul {{
+            list-style: none;
+            padding-left: 0;
+        }}
+        .toc li {{
+            margin: 8px 0;
+        }}
+        .toc a {{
+            color: #007bff;
+            text-decoration: none;
+            padding: 5px 0;
+            display: block;
+        }}
+        .toc a:hover {{
+            text-decoration: underline;
+        }}
+        @media (max-width: 768px) {{
+            .content {{ padding: 20px; }}
+            .header {{ padding: 20px; }}
+            .header h1 {{ font-size: 1.8em; }}
+            .summary-grid, .severity-breakdown {{ grid-template-columns: 1fr; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Multi-Vendor Configuration Vulnerability Assessment</h1>
+            <div class="subtitle">Security Analysis Report for {results['vendor']} Device</div>
+            <div style="margin-top: 15px; font-size: 0.9em;">
+                Generated: {datetime.now().strftime('%A, %B %d, %Y at %I:%M %p')}<br>
+                Total Findings: {results['summary']['total_findings']} | 
+                Average CVSS: {results['summary']['avg_cvss_score']:.1f}
+            </div>
+        </div>
+        
+        <div class="content">
+            <!-- Executive Summary -->
+            <div class="summary-section">
+                <h2 style="margin-top: 0;">Executive Summary</h2>
+                <p>This report contains the results of a comprehensive security analysis performed on a {results['vendor']} network device configuration. The analysis identified <strong>{results['summary']['total_findings']} security findings</strong> across multiple categories.</p>
+                
+                <div class="severity-breakdown">"""
+    
+    # Add severity breakdown
+    for severity in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+        count = results['summary']['severity_breakdown'].get(severity, 0)
+        if count > 0:
+            color = severity_colors[severity]
+            html_content += f"""
+                    <div class="severity-item">
+                        <div class="count" style="color: {color};">{count}</div>
+                        <div class="label" style="color: {color};">{severity}</div>
+                    </div>"""
+    
+    html_content += """
+                </div>
+                
+                <div class="summary-grid">
+                    <div class="summary-item">
+                        <h3>Detected Vendor</h3>
+                        <div class="value" style="font-size: 1.4em;">{}</div>
+                    </div>
+                    <div class="summary-item">
+                        <h3>Configuration Items</h3>
+                        <div class="value">{}</div>
+                    </div>""".format(results['vendor'], len(set(f['category'] for f in results['findings'])))
+    
+    if results['cva_stats']['loaded']:
+        mapped_findings = sum(1 for f in results['findings'] if f.get('cva_id'))
+        html_content += f"""
+                    <div class="summary-item">
+                        <h3>CVA Mappings</h3>
+                        <div class="value">{mapped_findings}</div>
+                    </div>"""
+    
+    html_content += """
+                </div>
+            </div>
+            
+            <!-- Table of Contents -->
+            <div class="toc">
+                <h3>Table of Contents</h3>
+                <ul>"""
+    
+    # Generate TOC
+    section_num = 1
+    for category in sorted(findings_by_category.keys()):
+        count = len(findings_by_category[category])
+        html_content += f'<li><a href="#section-{section_num}">{section_num}. {category} ({count} findings)</a></li>'
+        section_num += 1
+    
+    html_content += """
+                </ul>
+            </div>
+            
+            <!-- Detailed Findings -->"""
+    
+    # Generate detailed findings sections
+    section_num = 1
+    for category in sorted(findings_by_category.keys()):
+        findings = findings_by_category[category]
+        html_content += f"""
+            <div class="section" id="section-{section_num}">
+                <h2>{section_num}. {category} ({len(findings)} findings)</h2>"""
+        
+        for i, finding in enumerate(findings, 1):
+            severity_color = severity_colors.get(finding['severity'], '#6c757d')
+            cva_display = finding.get('cva_id', 'Not Mapped')
+            
+            html_content += f"""
+                <div class="finding">
+                    <div class="finding-header">
+                        <h3 class="finding-title">{finding['title']}</h3>
+                        <div class="finding-meta">
+                            <span class="severity-badge" style="background-color: {severity_color};">
+                                {finding['severity']}
+                            </span>
+                            <span><strong>CVSS:</strong> {finding['cvss_score']:.1f}</span>
+                            <span><strong>CVA ID:</strong> {cva_display}</span>
+                        </div>
+                    </div>
+                    <div class="finding-body">
+                        <div class="finding-section">
+                            <h4>Description</h4>
+                            <p>{finding['description']}</p>
+                        </div>
+                        
+                        <div class="finding-section">
+                            <h4>Configuration</h4>
+                            <div class="config-code">{finding['config_line']}</div>
+                        </div>
+                        
+                        <div class="finding-section">
+                            <h4>Recommendation</h4>
+                            <p>{finding['recommendation']}</p>
+                        </div>
+                        
+                        <div class="finding-section">
+                            <h4>CVSS Vector</h4>
+                            <div class="cvss-score">{finding['cvss_vector']}</div>
+                        </div>
+                        
+                        <div class="finding-section">
+                            <h4>NIST Controls</h4>
+                            <div class="nist-controls">"""
+            
+            for control in finding['nist_controls']:
+                html_content += f'<span class="nist-control">{control}</span>'
+            
+            html_content += """
+                            </div>
+                        </div>
+                    </div>
+                </div>"""
+        
+        html_content += "</div>"
+        section_num += 1
+    
+    html_content += f"""
+        </div>
+        
+        <div class="footer">
+            <p>Report generated by Multi-Vendor Configuration Vulnerability Assessment Tool</p>
+            <p>Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 
+               CVA Mappings: {'Loaded' if results['cva_stats']['loaded'] else 'Not Available'}</p>
+        </div>
+    </div>
+</body>
+</html>"""
+    
+    return html_content
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
