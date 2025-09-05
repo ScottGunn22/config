@@ -13,8 +13,8 @@ from tempfile import TemporaryFile
 from flask import Flask, request, render_template_string, jsonify, session, flash, redirect, url_for, make_response
 from werkzeug.utils import secure_filename
 
-# Import the improved multi-vendor analyzer
-from improved_parser_example import MultiVendorAnalyzer as ImprovedAnalyzer
+# Import the legacy-compatible multi-vendor analyzer
+from improved_parser_legacy import LegacyMultiVendorAnalyzer
 
 class Vendor(Enum):
     CISCO_IOS = "Cisco IOS"
@@ -70,576 +70,6 @@ class CVSSCalculator:
         vector = f"CVSS:3.1/AV:{attack_vector}/AC:{attack_complexity}/PR:{privileges_required}/UI:{user_interaction}/S:{scope}/C:{confidentiality}/I:{integrity}/A:{availability}"
         
         return base_score, vector
-
-class VendorDetector:
-    @staticmethod
-    def detect_vendor(config_content: str) -> Vendor:
-        config_lower = config_content.lower()
-        
-        cisco_indicators = [
-            "version 15", "version 12", "cisco ios", "enable secret",
-            "ip http server", "snmp-server community", "line con 0",
-            "line vty", "interface gigabitethernet", "router ospf"
-        ]
-        
-        juniper_indicators = [
-            "version 20", "version 19", "junos", "set system",
-            "set interfaces", "set routing-options", "set security",
-            "set policy-options", "set firewall"
-        ]
-        
-        fortinet_indicators = [
-            "config system global", "config firewall policy",
-            "config user local", "config system interface",
-            "fortios", "fortigate"
-        ]
-        
-        paloalto_indicators = [
-            "config mgt-config", "config deviceconfig system",
-            "config network interface", "config rulebase security",
-            "pan-os", "panos"
-        ]
-        
-        cisco_count = sum(1 for indicator in cisco_indicators if indicator in config_lower)
-        juniper_count = sum(1 for indicator in juniper_indicators if indicator in config_lower)
-        fortinet_count = sum(1 for indicator in fortinet_indicators if indicator in config_lower)
-        paloalto_count = sum(1 for indicator in paloalto_indicators if indicator in config_lower)
-        
-        max_count = max(cisco_count, juniper_count, fortinet_count, paloalto_count)
-        
-        if max_count == 0:
-            return Vendor.UNKNOWN
-        elif cisco_count == max_count:
-            return Vendor.CISCO_IOS
-        elif juniper_count == max_count:
-            return Vendor.JUNIPER_JUNOS
-        elif fortinet_count == max_count:
-            return Vendor.FORTINET_FORTIOS
-        elif paloalto_count == max_count:
-            return Vendor.PALOALTO_PANOS
-        
-        return Vendor.UNKNOWN
-
-@dataclass
-class Finding:
-    id: str
-    category: str
-    severity: str
-    title: str
-    description: str
-    line_number: int
-    config_line: str
-    recommendation: str
-    cvss_score: float
-    cvss_vector: str
-    nist_controls: List[str]
-    vendor: str
-    source: str = "automated"
-    cva_id: Optional[str] = None
-
-class MultiVendorAnalyzer:
-    def __init__(self, cva_mappings: Optional[Dict] = None):
-        self.cva_mappings = cva_mappings or {}
-        self.findings: List[Finding] = []
-        self.config_lines: List[str] = []
-        self.vendor: Vendor = Vendor.UNKNOWN
-        
-    def load_config_from_string(self, config_content: str) -> None:
-        self.config_lines = config_content.split('\n')
-        self.vendor = VendorDetector.detect_vendor(config_content)
-        
-    def analyze(self, config_content: str) -> List[Dict[str, Any]]:
-        self.findings.clear()
-        self.load_config_from_string(config_content)
-        
-        if self.vendor == Vendor.CISCO_IOS:
-            self._analyze_cisco_ios()
-        elif self.vendor == Vendor.JUNIPER_JUNOS:
-            self._analyze_juniper_junos()
-        elif self.vendor == Vendor.FORTINET_FORTIOS:
-            self._analyze_fortinet_fortios()
-        elif self.vendor == Vendor.PALOALTO_PANOS:
-            self._analyze_paloalto_panos()
-        
-        self._apply_cva_mappings()
-        
-        return [finding.__dict__ for finding in self.findings]
-        
-    def _analyze_cisco_ios(self):
-        for line_num, line in enumerate(self.config_lines, 1):
-            line_stripped = line.strip()
-            
-            # Authentication checks
-            if re.search(r'password\s+7\s+', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Authentication", "HIGH", "Cisco Type 7 Password",
-                    "Type 7 passwords are weakly encrypted and can be easily reversed",
-                    line_num, line_stripped,
-                    "Replace with enable secret or use stronger encryption",
-                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "L", "A": "N"},
-                    ["IA-5", "CM-6"],
-                    finding_type="cisco_type_7_pass"
-                )
-            
-            if re.search(r'password\s+0\s+', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Authentication", "CRITICAL", "Plain Text Password",
-                    "Password stored in plain text without encryption",
-                    line_num, line_stripped,
-                    "Use enable secret or encrypted passwords",
-                    {"AV": "L", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
-                    ["IA-5", "CM-6"],
-                    finding_type="pass_enc"
-                )
-            
-            if re.search(r'enable\s+password\s+\w+', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Authentication", "HIGH", "Enable Password Used",
-                    "Plain text enable password configured instead of enable secret",
-                    line_num, line_stripped,
-                    "Replace with enable secret command",
-                    {"AV": "L", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
-                    ["IA-5", "CM-6"],
-                    finding_type="enable_secret"
-                )
-            
-            if re.search(r'password\s+(\w{1,7}|cisco|admin|password|123456|default)$', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Authentication", "CRITICAL", "Weak/Default Password",
-                    "Weak or default password detected that is easily guessable",
-                    line_num, line_stripped,
-                    "Use complex passwords with minimum 8 characters, numbers, and symbols",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "H"},
-                    ["IA-5", "AC-2"],
-                    finding_type="default_password"
-                )
-            
-            # Service checks
-            if re.search(r'ip\s+http\s+server', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "MEDIUM", "HTTP Server Enabled",
-                    "HTTP management interface enabled without HTTPS",
-                    line_num, line_stripped,
-                    "Disable HTTP and enable HTTPS: 'no ip http server' and 'ip http secure-server'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
-                    ["SC-8", "CM-7"],
-                    finding_type="no_http_https"
-                )
-            
-            if re.search(r'service\s+finger', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "LOW", "Finger Service Enabled",
-                    "Finger service provides system information to attackers",
-                    line_num, line_stripped,
-                    "Disable finger service: 'no service finger'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
-                    ["CM-7"],
-                    finding_type="no_finger"
-                )
-            
-            if re.search(r'ip\s+bootp\s+server', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "MEDIUM", "BOOTP Server Enabled",
-                    "BOOTP server can be used for network reconnaissance",
-                    line_num, line_stripped,
-                    "Disable BOOTP server: 'no ip bootp server'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
-                    ["CM-7", "SC-7"],
-                    finding_type="no_bootp"
-                )
-            
-            if re.search(r'ip\s+source-route', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Network Services", "MEDIUM", "IP Source Routing Enabled",
-                    "IP source routing can be exploited to bypass network security controls",
-                    line_num, line_stripped,
-                    "Disable IP source routing: 'no ip source-route'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
-                    ["SC-7", "CM-7"],
-                    finding_type="no_source_route"
-                )
-            
-            # SNMP checks
-            if re.search(r'snmp-server\s+community\s+(public|private)', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "SNMP", "CRITICAL", "Default SNMP Community",
-                    "Default SNMP community strings detected",
-                    line_num, line_stripped,
-                    "Change to complex community string and restrict access",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "C", "C": "H", "I": "H", "A": "H"},
-                    ["IA-2", "AC-3"],
-                    finding_type="default_password"
-                )
-            
-            if re.search(r'snmp-server\s+community\s+\w+\s+RW', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "SNMP", "HIGH", "SNMP Write Access Enabled",
-                    "SNMP community with write access poses security risk",
-                    line_num, line_stripped,
-                    "Remove write access or use read-only communities with ACL restrictions",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "L"},
-                    ["AC-3", "CM-6"],
-                    finding_type="no_snmp_server_ro_rw"
-                )
-            
-            if re.search(r'snmp-server\s+community\s+\w{1,8}\s+', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "SNMP", "MEDIUM", "Short SNMP Community String",
-                    "SNMP community string is too short and easily guessable",
-                    line_num, line_stripped,
-                    "Use complex community string with 16+ characters",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
-                    ["IA-2", "AC-3"],
-                    finding_type="no_snmp_server_ro_rw"
-                )
-            
-            # Access Control checks
-            if re.search(r'transport\s+input\s+telnet', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Access Control", "HIGH", "Telnet Access Enabled",
-                    "Telnet provides unencrypted remote access",
-                    line_num, line_stripped,
-                    "Use SSH only: 'transport input ssh'",
-                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
-                    ["SC-8", "AC-17"],
-                    finding_type="transport_input"
-                )
-            
-            if re.search(r'transport\s+input\s+all', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Access Control", "HIGH", "All Transport Methods Enabled",
-                    "All transport methods (including insecure protocols) are enabled",
-                    line_num, line_stripped,
-                    "Restrict to SSH only: 'transport input ssh'",
-                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
-                    ["SC-8", "AC-17"],
-                    finding_type="transport_all"
-                )
-            
-            if re.search(r'exec-timeout\s+0\s+0', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Access Control", "MEDIUM", "No Session Timeout",
-                    "Console/VTY session timeout is disabled",
-                    line_num, line_stripped,
-                    "Set appropriate timeout: 'exec-timeout 10 0'",
-                    {"AV": "P", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
-                    ["AC-12", "SC-10"],
-                    finding_type="session_timeout"
-                )
-            
-            # Network service checks
-            if re.search(r'cdp\s+run', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Network Services", "LOW", "CDP Enabled Globally",
-                    "Cisco Discovery Protocol exposes network topology information",
-                    line_num, line_stripped,
-                    "Disable CDP globally or on external interfaces: 'no cdp run'",
-                    {"AV": "A", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
-                    ["SC-7", "CM-7"],
-                    finding_type="cdp_cisco"
-                )
-            
-            if re.search(r'ip\s+proxy-arp', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Network Services", "LOW", "Proxy ARP Enabled",
-                    "Proxy ARP can be exploited for man-in-the-middle attacks",
-                    line_num, line_stripped,
-                    "Disable proxy ARP: 'no ip proxy-arp'",
-                    {"AV": "A", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
-                    ["SC-7", "CM-7"],
-                    finding_type="no_proxy_arp"
-                )
-            
-            if re.search(r'ip\s+directed-broadcast', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Network Services", "MEDIUM", "Directed Broadcast Enabled",
-                    "IP directed broadcast can be used for DDoS amplification attacks",
-                    line_num, line_stripped,
-                    "Disable directed broadcast: 'no ip directed-broadcast'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "C", "C": "N", "I": "N", "A": "H"},
-                    ["SC-7", "CM-7"],
-                    finding_type="no_directed_broadcast"
-                )
-            
-            # Additional authentication checks
-            if re.search(r'username\s+\w+\s+password\s+0\s+', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Authentication", "HIGH", "Plain Text Username Password",
-                    "Username configured with plain text password",
-                    line_num, line_stripped,
-                    "Use encrypted passwords or enable service password-encryption",
-                    {"AV": "L", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
-                    ["IA-5", "CM-6"],
-                    finding_type="pass_enc"
-                )
-            
-            # Logging checks
-            if re.search(r'^logging\s+\d+\.\d+\.\d+\.\d+$', line_stripped, re.IGNORECASE):
-                if not re.search(r'logging\s+trap', '\n'.join(self.config_lines), re.IGNORECASE):
-                    self.add_finding(
-                        "Logging", "LOW", "Basic Logging Configuration",
-                        "Logging host configured but trap level not specified",
-                        line_num, line_stripped,
-                        "Configure appropriate logging level: 'logging trap informational'",
-                        {"AV": "N", "AC": "L", "PR": "H", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
-                        ["AU-3", "AU-6"],
-                        finding_type="basic_logging"
-                    )
-            
-            # Banner checks
-            if not any(re.search(r'banner\s+(login|motd)', config_line, re.IGNORECASE) for config_line in self.config_lines):
-                if line_num == len(self.config_lines):  # Only check once at end
-                    self.add_finding(
-                        "Access Control", "LOW", "Missing Login Banner",
-                        "No login banner configured to warn unauthorized users",
-                        1, "Configuration",
-                        "Configure login banner: 'banner login ^C Unauthorized access prohibited ^C'",
-                        {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "N", "I": "L", "A": "N"},
-                        ["AC-8"],
-                        finding_type="missing_banner"
-                    )
-            
-            # Service checks - additional
-            if re.search(r'service\s+tcp-small-servers', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "MEDIUM", "TCP Small Servers Enabled",
-                    "TCP small servers provide unnecessary attack vectors",
-                    line_num, line_stripped,
-                    "Disable TCP small servers: 'no service tcp-small-servers'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "L"},
-                    ["CM-7"],
-                    finding_type="no_small_servers"
-                )
-            
-            if re.search(r'service\s+udp-small-servers', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "MEDIUM", "UDP Small Servers Enabled",
-                    "UDP small servers provide unnecessary attack vectors",
-                    line_num, line_stripped,
-                    "Disable UDP small servers: 'no service udp-small-servers'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "L"},
-                    ["CM-7"],
-                    finding_type="no_small_servers"
-                )
-            
-            # NTP security check
-            if re.search(r'ntp\s+server\s+\d+\.\d+\.\d+\.\d+', line_stripped, re.IGNORECASE):
-                if not re.search(r'ntp\s+authenticate', '\n'.join(self.config_lines), re.IGNORECASE):
-                    self.add_finding(
-                        "System", "LOW", "NTP Authentication Disabled",
-                        "NTP server configured without authentication",
-                        line_num, line_stripped,
-                        "Enable NTP authentication: 'ntp authenticate' and 'ntp trusted-key'",
-                        {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "N", "I": "L", "A": "L"},
-                        ["SC-45"],
-                        finding_type="ntp_no_auth"
-                    )
-        
-        # Global configuration checks
-        config_text = '\n'.join(self.config_lines)
-        
-        # Check for missing service password-encryption
-        if not re.search(r'service\s+password-encryption', config_text, re.IGNORECASE):
-            self.add_finding(
-                "Authentication", "MEDIUM", "Password Encryption Disabled",
-                "Service password-encryption is not enabled",
-                1, "Global Configuration",
-                "Enable password encryption: 'service password-encryption'",
-                {"AV": "L", "AC": "L", "PR": "H", "UI": "N", "S": "U", "C": "M", "I": "N", "A": "N"},
-                ["IA-5", "CM-6"],
-                finding_type="no_password_encryption"
-            )
-        
-        # Check for missing AAA
-        if not re.search(r'aaa\s+', config_text, re.IGNORECASE):
-            self.add_finding(
-                "Authentication", "MEDIUM", "AAA Not Configured",
-                "Authentication, Authorization, and Accounting (AAA) is not configured",
-                1, "Global Configuration", 
-                "Configure AAA: 'aaa new-model' and appropriate authentication methods",
-                {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
-                ["IA-2", "AC-2", "AU-2"],
-                finding_type="aaa_auth"
-            )
-        
-        # Additional comprehensive checks
-        for line_num, line in enumerate(self.config_lines, 1):
-            line_stripped = line.strip()
-            
-            # Service checks
-            if re.search(r'service\s+pad', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "MEDIUM", "PAD Service Enabled",
-                    "Packet Assembler/Disassembler service provides unnecessary attack vector",
-                    line_num, line_stripped,
-                    "Disable PAD service: 'no service pad'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "L"},
-                    ["CM-7"],
-                    finding_type="no_service_pad"
-                )
-            
-            if re.search(r'ip\s+domain-lookup', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "LOW", "DNS Lookup Enabled", 
-                    "DNS lookup can cause CLI delays and information disclosure",
-                    line_num, line_stripped,
-                    "Disable DNS lookup: 'no ip domain-lookup'",
-                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "L"},
-                    ["CM-7"],
-                    finding_type="no_domain_lookup"
-                )
-            
-            # Additional ICMP checks
-            if re.search(r'ip\s+unreachables', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Network Services", "LOW", "ICMP Unreachables Enabled",
-                    "ICMP unreachable messages can aid network reconnaissance", 
-                    line_num, line_stripped,
-                    "Disable ICMP unreachables on external interfaces: 'no ip unreachables'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
-                    ["SC-7"],
-                    finding_type="no_unreachables"
-                )
-            
-            if re.search(r'ip\s+redirects', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Network Services", "LOW", "ICMP Redirects Enabled",
-                    "ICMP redirect messages can be used to manipulate routing tables",
-                    line_num, line_stripped, 
-                    "Disable ICMP redirects: 'no ip redirects'",
-                    {"AV": "A", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
-                    ["SC-7"],
-                    finding_type="no_redirect"
-                )
-            
-            if re.search(r'ip\s+mask-reply', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Network Services", "LOW", "ICMP Mask Reply Enabled",
-                    "ICMP mask reply messages expose network subnet information",
-                    line_num, line_stripped,
-                    "Disable ICMP mask reply: 'no ip mask-reply'", 
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "N", "A": "N"},
-                    ["SC-7"],
-                    finding_type="no_mask_reply"
-                )
-            
-            # FTP server check
-            if re.search(r'ftp-server', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "MEDIUM", "FTP Server Enabled",
-                    "FTP server provides unencrypted file transfer capabilities",
-                    line_num, line_stripped,
-                    "Disable FTP server or use secure alternatives like SCP/SFTP",
-                    {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "L", "A": "N"},
-                    ["SC-8", "CM-7"],
-                    finding_type="ftp_server"
-                )
-            
-            # SNMP version check
-            if re.search(r'snmp-server.*version\s+1', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "SNMP", "HIGH", "SNMP Version 1 Enabled",
-                    "SNMP version 1 has security vulnerabilities and should be disabled",
-                    line_num, line_stripped,
-                    "Use SNMP version 3 or disable: 'no snmp-server enable traps'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "L", "A": "N"},
-                    ["AC-3", "IA-2"],
-                    finding_type="snmp_ver_1"
-                )
-            
-            # Check for IPv6 enabled
-            if re.search(r'ipv6\s+(enable|unicast-routing)', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Network Services", "LOW", "IPv6 Enabled",
-                    "IPv6 is enabled which may introduce additional attack vectors if not properly secured",
-                    line_num, line_stripped,
-                    "Disable IPv6 if not required or ensure proper IPv6 security controls",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "L", "I": "L", "A": "N"},
-                    ["SC-7", "CM-6"],
-                    finding_type="ipv6_is_enabled"
-                )
-    
-    def _analyze_juniper_junos(self):
-        for line_num, line in enumerate(self.config_lines, 1):
-            line_stripped = line.strip()
-            
-            if re.search(r'set\s+system\s+services\s+telnet', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "HIGH", "Telnet Service Enabled",
-                    "Telnet service enabled on management interface",
-                    line_num, line_stripped,
-                    "Disable telnet: 'delete system services telnet'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
-                    ["SC-8", "CM-7"]
-                )
-                
-    def _analyze_fortinet_fortios(self):
-        for line_num, line in enumerate(self.config_lines, 1):
-            line_stripped = line.strip()
-            
-            if re.search(r'set\s+password\s+\w{1,8}$', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Authentication", "MEDIUM", "Weak Password",
-                    "Administrative password appears to be weak",
-                    line_num, line_stripped,
-                    "Use strong password policy with minimum 12 characters",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "L", "A": "N"},
-                    ["IA-5"]
-                )
-                
-    def _analyze_paloalto_panos(self):
-        for line_num, line in enumerate(self.config_lines, 1):
-            line_stripped = line.strip()
-            
-            if re.search(r'set\s+deviceconfig\s+system\s+service\s+disable-telnet\s+no', line_stripped, re.IGNORECASE):
-                self.add_finding(
-                    "Services", "HIGH", "Telnet Service Enabled",
-                    "Telnet management access is enabled",
-                    line_num, line_stripped,
-                    "Disable telnet: 'set deviceconfig system service disable-telnet yes'",
-                    {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "N"},
-                    ["SC-8", "CM-7"]
-                )
-    
-    def add_finding(self, category: str, severity: str, title: str, description: str,
-                   line_num: int, config_line: str, recommendation: str,
-                   cvss_vector_components: Dict[str, str], nist_controls: List[str],
-                   source: str = "automated", finding_type: Optional[str] = None) -> None:
-        
-        cvss_score, cvss_vector = CVSSCalculator.calculate_base_score(
-            cvss_vector_components["AV"], cvss_vector_components["AC"],
-            cvss_vector_components["PR"], cvss_vector_components["UI"],
-            cvss_vector_components["S"], cvss_vector_components["C"],
-            cvss_vector_components["I"], cvss_vector_components["A"]
-        )
-        
-        finding_id = f"{category.upper().replace(' ', '_')}_{len(self.findings) + 1}"
-        cva_id = self.cva_mappings.get(finding_type) if finding_type else None
-        
-        finding = Finding(
-            id=finding_id,
-            category=category,
-            severity=severity,
-            title=title,
-            description=description,
-            line_number=line_num,
-            config_line=config_line,
-            recommendation=recommendation,
-            cvss_score=cvss_score,
-            cvss_vector=cvss_vector,
-            nist_controls=nist_controls,
-            vendor=self.vendor.value,
-            source=source,
-            cva_id=cva_id
-        )
-        
-        self.findings.append(finding)
-    
-    def _apply_cva_mappings(self):
-        for finding in self.findings:
-            finding_key = finding.title.lower().replace(" ", "_").replace("-", "_")
-            if finding_key in self.cva_mappings:
-                finding.cva_id = self.cva_mappings[finding_key]
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-in-production'
@@ -757,7 +187,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Enterprise Network Configuration Vulnerability Assessment Tool</title>
+    <title>Enterprise Network Configuration Vulnerability Assessment Tool (Legacy Compatible)</title>
     <style>
         * {
             margin: 0;
@@ -797,6 +227,14 @@ HTML_TEMPLATE = '''
         .header p {
             font-size: 1.1em;
             opacity: 0.9;
+        }
+        
+        .legacy-notice {
+            background: #f39c12;
+            color: white;
+            padding: 10px 30px;
+            text-align: center;
+            font-weight: 600;
         }
         
         .content {
@@ -1054,7 +492,11 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1>Enterprise MCVA Tool</h1>
-            <p>Multi-Vendor Configuration Vulnerability Assessment</p>
+            <p>Multi-Vendor Configuration Vulnerability Assessment (Legacy Compatible)</p>
+        </div>
+        
+        <div class="legacy-notice">
+            🔧 Legacy Version - Compatible with ciscoconfparse 1.5.x
         </div>
         
         <div class="content">
@@ -1219,28 +661,28 @@ def index():
     # Load CVA mappings for internal finding numbers
     cva_mappings = load_static_cva_mappings()
     
-    # Use the improved multi-vendor analyzer
-    improved_analyzer = ImprovedAnalyzer()
-    analysis_results = improved_analyzer.analyze_configuration(config_content)
+    # Use the legacy-compatible multi-vendor analyzer
+    legacy_analyzer = LegacyMultiVendorAnalyzer()
+    analysis_results = legacy_analyzer.analyze_configuration(config_content)
     
     if 'error' in analysis_results:
         flash(f'Analysis error: {analysis_results["error"]}')
         return redirect(url_for('index'))
     
-    # Convert improved analyzer results to match expected format and apply CVA mappings
+    # Convert legacy analyzer results to match expected format and apply CVA mappings
     findings_data = []
     for finding_dict in analysis_results['findings']:
         # Smart CVA mapping using regex and fuzzy matching
         cva_id = map_finding_to_cva(finding_dict, cva_mappings) if cva_mappings else None
         
-        # Map the improved format to the web app format
+        # Map the legacy format to the web app format
         findings_data.append({
             'id': finding_dict['id'],
             'category': finding_dict['category'],
             'severity': finding_dict['severity'],
             'title': finding_dict['title'],
             'description': finding_dict['description'],
-            'line_number': 1,  # Improved analyzer doesn't track line numbers the same way
+            'line_number': 1,  # Legacy analyzer doesn't track line numbers the same way
             'config_line': finding_dict['config_object'],
             'recommendation': finding_dict['recommendation'],
             'cvss_score': finding_dict['cvss_score'],
@@ -1296,8 +738,8 @@ def export(format):
     
     elif format == 'txt':
         output = []
-        output.append("ENTERPRISE NETWORK SECURITY ASSESSMENT REPORT")
-        output.append("=" * 50)
+        output.append("ENTERPRISE NETWORK SECURITY ASSESSMENT REPORT (LEGACY COMPATIBLE)")
+        output.append("=" * 70)
         output.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         output.append(f"Vendor: {results['vendor']}")
         output.append(f"Average CVSS: {results['summary']['avg_cvss_score']:.1f}")
@@ -1330,14 +772,12 @@ def export(format):
             output.append(f"[{finding['severity']}] {finding['title']}")
             output.append(f"  Category: {finding['category']}")
             output.append(f"  CVSS: {finding['cvss_score']:.1f} ({finding['cvss_vector']})")
-            output.append(f"  Line {finding['line_number']}: {finding['config_line']}")
+            output.append(f"  Configuration: {finding['config_line']}")
             output.append(f"  Description: {finding['description']}")
             output.append(f"  Recommendation: {finding['recommendation']}")
             output.append(f"  NIST Controls: {', '.join(finding['nist_controls'])}")
             if finding.get('cva_id'):
                 output.append(f"  CVA ID: {finding['cva_id']}")
-            if finding.get('organizational_context'):
-                output.append(f"  Org Context: {finding['organizational_context']}")
             output.append("")
         
         response = make_response('\n'.join(output))
@@ -1379,7 +819,7 @@ def generate_html_report(results: Dict, timestamp: str) -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Multi-Vendor Configuration Vulnerability Assessment Report</title>
+    <title>Multi-Vendor Configuration Vulnerability Assessment Report (Legacy Compatible)</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -1411,6 +851,13 @@ def generate_html_report(results: Dict, timestamp: str) -> str:
             font-size: 1.2em;
             opacity: 0.9;
         }}
+        .legacy-notice {{
+            background: #f39c12;
+            color: white;
+            padding: 15px;
+            text-align: center;
+            font-weight: 600;
+        }}
         .content {{
             padding: 40px;
         }}
@@ -1420,28 +867,6 @@ def generate_html_report(results: Dict, timestamp: str) -> str:
             margin-bottom: 40px;
             border-radius: 8px;
             border-left: 5px solid #007bff;
-        }}
-        .summary-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-top: 20px;
-        }}
-        .summary-item {{
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            text-align: center;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }}
-        .summary-item h3 {{
-            margin: 0 0 10px 0;
-            color: #2c3e50;
-        }}
-        .summary-item .value {{
-            font-size: 2em;
-            font-weight: bold;
-            color: #007bff;
         }}
         .severity-breakdown {{
             display: grid;
@@ -1460,11 +885,6 @@ def generate_html_report(results: Dict, timestamp: str) -> str:
             font-size: 1.8em;
             font-weight: bold;
             margin-bottom: 5px;
-        }}
-        .severity-item .label {{
-            font-size: 0.9em;
-            font-weight: 600;
-            text-transform: uppercase;
         }}
         .section {{
             margin: 40px 0;
@@ -1560,38 +980,6 @@ def generate_html_report(results: Dict, timestamp: str) -> str:
             text-align: center;
             font-size: 0.9em;
         }}
-        .toc {{
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 8px;
-            margin-bottom: 30px;
-        }}
-        .toc h3 {{
-            margin-top: 0;
-            color: #2c3e50;
-        }}
-        .toc ul {{
-            list-style: none;
-            padding-left: 0;
-        }}
-        .toc li {{
-            margin: 8px 0;
-        }}
-        .toc a {{
-            color: #007bff;
-            text-decoration: none;
-            padding: 5px 0;
-            display: block;
-        }}
-        .toc a:hover {{
-            text-decoration: underline;
-        }}
-        @media (max-width: 768px) {{
-            .content {{ padding: 20px; }}
-            .header {{ padding: 20px; }}
-            .header h1 {{ font-size: 1.8em; }}
-            .summary-grid, .severity-breakdown {{ grid-template-columns: 1fr; }}
-        }}
     </style>
 </head>
 <body>
@@ -1606,11 +994,15 @@ def generate_html_report(results: Dict, timestamp: str) -> str:
             </div>
         </div>
         
+        <div class="legacy-notice">
+            🔧 Legacy Compatible Version - Works with ciscoconfparse 1.5.x
+        </div>
+        
         <div class="content">
             <!-- Executive Summary -->
             <div class="summary-section">
                 <h2 style="margin-top: 0;">Executive Summary</h2>
-                <p>This report contains the results of a comprehensive security analysis performed on a {results['vendor']} network device configuration. The analysis identified <strong>{results['summary']['total_findings']} security findings</strong> across multiple categories.</p>
+                <p>This report contains the results of a comprehensive security analysis performed on a {results['vendor']} network device configuration using legacy-compatible parsing. The analysis identified <strong>{results['summary']['total_findings']} security findings</strong> across multiple categories.</p>
                 
                 <div class="severity-breakdown">"""
     
@@ -1627,43 +1019,6 @@ def generate_html_report(results: Dict, timestamp: str) -> str:
     
     html_content += """
                 </div>
-                
-                <div class="summary-grid">
-                    <div class="summary-item">
-                        <h3>Detected Vendor</h3>
-                        <div class="value" style="font-size: 1.4em;">{}</div>
-                    </div>
-                    <div class="summary-item">
-                        <h3>Configuration Items</h3>
-                        <div class="value">{}</div>
-                    </div>""".format(results['vendor'], len(set(f['category'] for f in results['findings'])))
-    
-    if results['cva_stats']['loaded']:
-        mapped_findings = sum(1 for f in results['findings'] if f.get('cva_id'))
-        html_content += f"""
-                    <div class="summary-item">
-                        <h3>CVA Mappings</h3>
-                        <div class="value">{mapped_findings}</div>
-                    </div>"""
-    
-    html_content += """
-                </div>
-            </div>
-            
-            <!-- Table of Contents -->
-            <div class="toc">
-                <h3>Table of Contents</h3>
-                <ul>"""
-    
-    # Generate TOC
-    section_num = 1
-    for category in sorted(findings_by_category.keys()):
-        count = len(findings_by_category[category])
-        html_content += f'<li><a href="#section-{section_num}">{section_num}. {category} ({count} findings)</a></li>'
-        section_num += 1
-    
-    html_content += """
-                </ul>
             </div>
             
             <!-- Detailed Findings -->"""
@@ -1733,9 +1088,10 @@ def generate_html_report(results: Dict, timestamp: str) -> str:
         </div>
         
         <div class="footer">
-            <p>Report generated by Multi-Vendor Configuration Vulnerability Assessment Tool</p>
+            <p>Report generated by Multi-Vendor Configuration Vulnerability Assessment Tool (Legacy Compatible)</p>
             <p>Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 
-               CVA Mappings: {'Loaded' if results['cva_stats']['loaded'] else 'Not Available'}</p>
+               CVA Mappings: {'Loaded' if results['cva_stats']['loaded'] else 'Not Available'} |
+               Compatible with ciscoconfparse 1.5.x</p>
         </div>
     </div>
 </body>
