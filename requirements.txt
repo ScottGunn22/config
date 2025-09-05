@@ -1,0 +1,5 @@
+Flask==2.3.3
+Werkzeug==2.3.7
+ciscoconfparse==1.7.18
+xmltodict==0.13.0
+PyYAML==6.0.1
